@@ -22,9 +22,21 @@ const STOPWORDS = new Set([
 
 /** Controlled synonym groups — every member normalizes to the group's
  *  first entry. Intentionally small and curated (not a general thesaurus)
- *  so it can't introduce false positives. */
+ *  so it can't introduce false positives. Each group covers words that
+ *  are lexically DIFFERENT (not just typos/spacing — those are already
+ *  handled by tokenMatches' Levenshtein fallback below); RAM/"memoria"
+ *  is deliberately NOT included here — those words essentially never
+ *  appear literally in a real product name (capacity is stored as
+ *  e.g. "128GB"), so mapping them wouldn't match anything real; that
+ *  kind of loose intent ("que tenga bastante memoria" → sort by
+ *  capacity) belongs to the LLM's own reasoning over the tool results,
+ *  not to string-token matching. */
 const SYNONYM_GROUPS: string[][] = [
-  ['tv', 'televisor', 'television', 'smarttv'],
+  ['tv', 'televisor', 'television', 'smarttv', 'tele'],
+  ['aire', 'acondicionador', 'ac'],
+  ['nevera', 'refrigerador', 'refrigeradora', 'frigider'],
+  ['abanico', 'ventilador'],
+  ['celular', 'telefono', 'movil', 'smartphone', 'cel'],
 ]
 const SYNONYM_MAP: Map<string, string> = new Map(
   SYNONYM_GROUPS.flatMap((group) => group.map((word) => [word, group[0]] as const)),
@@ -61,6 +73,9 @@ export function normalizeText(raw: string): string {
   // GLUED because that's how these already appear in real product
   // names ("SAMSUNG A05 128GB"), unlike inches.
   s = s.replace(/\b(\d+)\s*(gb|mb|tb)\b/gi, '$1$2')
+  // "64 gigas" / "64 giga" — same idea, spelled-out colloquial form —
+  // normalizes to the same glued "64gb" so it matches a stored "64GB".
+  s = s.replace(/\b(\d+)\s*gigas?\b/gi, '$1gb')
   s = s.replace(/\s+/g, ' ').trim()
   return s
 }
@@ -209,17 +224,48 @@ export function rankBySignificantTokens<T>(
   const { core, bonus } = tokenizeForRanking(normalizeText(query))
   if (core.length === 0) return []
   const queryTokens = [...core, ...bonus]
+  const candidateTokenLists = candidates.map((item) => significantTokens(normalizeText(getSearchableText(item))))
+
+  // A PURELY ALPHABETIC core token that matches NOTHING anywhere
+  // across this whole candidate set — a subjective qualifier like
+  // "barata"/"buena"/"mejor" that was never a real catalog attribute
+  // to begin with — must not be allowed to silently veto an otherwise
+  // -good query. Without this, "una laptop barata" would require BOTH
+  // "laptop" AND "barata" to match the SAME row (majority-of-2 = 2),
+  // and since no product name ever literally says "barata", it would
+  // find zero laptops even when real ones exist (AI Sales Agent
+  // audit, Part 10).
+  //
+  // Any token that CONTAINS A DIGIT is always kept, matched or not —
+  // it's a model code ("a07") or a size/capacity ("64", "50"), exactly
+  // the class of token the strict-majority threshold exists to
+  // protect (see the comment below: "Samsung A07" must never loosely
+  // match "Samsung A05" just because "samsung" alone is common).
+  // Relaxing on those would reopen that exact bug whenever a specific
+  // model happens to be absent from a catalog — "no lo tenemos" is
+  // the correct answer there, not silently surfacing a different
+  // model as if it were a match. A bare WORD token (no digit — a
+  // brand name, a qualifier) only counts when it matches something
+  // somewhere; "xiaomi" matching nothing but "telefono" matching real
+  // phones is fine to relax — showing other brands as alternatives is
+  // normal, expected retail behavior (Part 7 — "puede sugerir una
+  // alternativa real"), not a precision bug the way model-number
+  // substitution would be.
+  const effectiveCore = core.filter(
+    (qt) => /\d/.test(qt) || candidateTokenLists.some((tokens) => tokens.some((ct) => tokenMatches(qt, ct))),
+  )
+  const effectiveCoreLength = effectiveCore.length > 0 ? effectiveCore.length : core.length
   // Based on CORE tokens only — a speculative merge token like "de64"
   // (from "de 64", where "de" is just a stopword adjacent to a number)
   // must never count toward the denominator: it can only ever add a
   // match, never itself be required, or "de 64" (real content: just
   // "64") would need its own noise byproduct to also match something
   // it structurally never can, and wrongly find nothing.
-  const minMatched = Math.max(1, Math.floor(core.length / 2) + 1)
+  const minMatched = Math.max(1, Math.floor(effectiveCoreLength / 2) + 1)
 
   const scored: ScoredMatch<T>[] = []
-  for (const item of candidates) {
-    const candidateTokens = significantTokens(normalizeText(getSearchableText(item)))
+  candidates.forEach((item, i) => {
+    const candidateTokens = candidateTokenLists[i]
     let matched = 0
     let score = 0
     for (const qt of queryTokens) {
@@ -235,7 +281,7 @@ export function rankBySignificantTokens<T>(
       }
     }
     if (matched >= minMatched) scored.push({ item, score, matchedTokens: matched })
-  }
+  })
 
   scored.sort((a, b) => {
     if (b.score !== a.score) return b.score - a.score

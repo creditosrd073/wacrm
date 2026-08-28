@@ -20,6 +20,7 @@ import type {
   CatalogProduct,
   CatalogProvider,
   CatalogSearchArgs,
+  CatalogSearchResult,
 } from '../types'
 
 /** Cap on how many of this data source's rows the in-memory fallback
@@ -46,6 +47,15 @@ interface CatalogProductRow {
   available_quantity: number | null
   primary_image_url: string | null
   images: { url: string; alt?: string }[] | null
+}
+
+/** Only present on rows returned by the search_ai_catalog_products RPC
+ *  (migration 047) — count(*) OVER() computed over the FULL filtered
+ *  set before LIMIT/OFFSET, so every row in one response carries the
+ *  same true total. Absent (undefined) on rows read via plain
+ *  `.select('*')` (getProduct, the fallback-tier scan). */
+interface CatalogProductRowWithTotal extends CatalogProductRow {
+  total_count?: number | string
 }
 
 /** Provider key prefix for structured-data-source-backed providers. See
@@ -90,53 +100,100 @@ export class DataSourceCatalogProvider implements CatalogProvider {
     this.label = displayName
   }
 
-  async searchCatalog(args: CatalogSearchArgs): Promise<CatalogProduct[]> {
+  async searchCatalog(args: CatalogSearchArgs): Promise<CatalogSearchResult> {
     const limit = args.limit ?? 10
+    const offset = args.offset ?? 0
     const { data, error } = await this.db.rpc('search_ai_catalog_products', {
       p_account_id: this.accountId,
       p_data_source_ids: [this.dataSourceId],
       p_query: args.query ?? '',
       p_color: args.color ?? null,
       p_match_count: limit,
+      p_offset: offset,
+      p_available_only: args.availableOnly ?? false,
     })
     if (error) {
       console.error('[catalog] data-source search failed:', error.message)
-      return []
+      return { products: [], total: null, hasMore: false }
     }
-    const exact = ((data ?? []) as CatalogProductRow[]).map((r) => rowToProduct(r, this.key, this.label))
-    if (exact.length > 0 || !args.query || !args.query.trim()) return exact
+    const rows = (data ?? []) as CatalogProductRowWithTotal[]
+    if (rows.length > 0) {
+      const total = Number(rows[0].total_count ?? rows.length)
+      return {
+        products: rows.map((r) => rowToProduct(r, this.key, this.label)),
+        total,
+        hasMore: offset + rows.length < total,
+      }
+    }
+    if (!args.query || !args.query.trim()) {
+      return { products: [], total: 0, hasMore: false }
+    }
 
     // Progressive fallback (AI_Catalog_Fix_Kit FASE 5): the DB-side
     // exact/FTS pass found nothing, e.g. `TCL de 50 pulgadas` against a
     // stored name of `TV TCL ... 50 ...` with no literal "pulgadas".
     // Scan this source's rows and rank by normalized/tolerant token
     // overlap instead of failing straight to "no encontrado".
+    //
+    // Falls through regardless of `offset`: the DB tier's WHERE clause
+    // doesn't depend on offset for WHETHER anything matches, only which
+    // slice is returned — so if it found zero rows at this query, it
+    // would find zero at ANY offset too, and this is never reached in
+    // practice with a non-zero offset anyway (the resolver, the only
+    // real caller, always asks each provider for its own rows from 0 —
+    // see catalog/resolver.ts's module doc). A direct caller that does
+    // pass a non-zero offset here gets the tolerant tier's own
+    // [offset, offset+limit) slice below, which is internally
+    // consistent (same ranking every call for the same query).
     return this.fallbackSearch(args)
   }
 
-  private async fallbackSearch(args: CatalogSearchArgs): Promise<CatalogProduct[]> {
+  private async fallbackSearch(args: CatalogSearchArgs): Promise<CatalogSearchResult> {
     const limit = args.limit ?? 10
+    const offset = args.offset ?? 0
     const { data, error } = await this.db
       .from('ai_catalog_products')
       .select('*')
       .eq('account_id', this.accountId)
       .eq('data_source_id', this.dataSourceId)
+      // Deterministic base order — without it Postgres doesn't
+      // guarantee the same row order across separate calls, and since
+      // rankBySignificantTokens' sort is stable (ties keep INPUT
+      // order), an undeterministic scan here would make pagination
+      // within this tier flaky: the same row could land on two
+      // different pages, or on neither, between the offset=0 and
+      // offset=N calls of one "dame todas las X" listing.
+      .order('id', { ascending: true })
       .limit(FALLBACK_SCAN_LIMIT)
     if (error || !data) {
       if (error) console.error('[catalog] fallback scan failed:', error.message)
-      return []
+      return { products: [], total: null, hasMore: false }
     }
 
-    const rows = data as CatalogProductRow[]
+    const rows = (data as CatalogProductRow[]).filter((r) => !args.availableOnly || r.available)
     const ranked = rankBySignificantTokens(
       args.query,
       rows,
       (r) => [r.name, r.sku, r.brand, r.model, r.color, r.capacity, r.size].filter(Boolean).join(' '),
     )
-    const filtered = args.color
+    const colorFiltered = args.color
       ? ranked.filter((m) => !m.item.color || m.item.color.toLowerCase().includes(args.color!.toLowerCase()))
       : ranked
-    return filtered.slice(0, limit).map((m) => rowToProduct(m.item, this.key, this.label))
+    // Stable partition: available matches first, agotados after —
+    // relative ranking order preserved within each group. Mirrors the
+    // DB tier's `ORDER BY available DESC, rank DESC` (migration 047)
+    // so a customer browsing ("qué tienen") never sees an agotado item
+    // pushed ahead of an available one just because this particular
+    // query happened to miss the DB-side FTS pass and land here
+    // instead (AI Sales Agent audit, Part 9).
+    const filtered = [...colorFiltered.filter((m) => m.item.available), ...colorFiltered.filter((m) => !m.item.available)]
+    const page = filtered.slice(offset, offset + limit).map((m) => rowToProduct(m.item, this.key, this.label))
+    // `total` here is honestly bounded by FALLBACK_SCAN_LIMIT — this
+    // tier only ever scans the first 500 rows of the data source, so
+    // for a source with more rows than that, a very broad query could
+    // under-count. True for both `total` and `hasMore` alike; noted
+    // rather than silently presented as exact.
+    return { products: page, total: filtered.length, hasMore: offset + page.length < filtered.length }
   }
 
   async getProduct(nativeId: string): Promise<CatalogProduct | null> {
