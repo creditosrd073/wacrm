@@ -53,7 +53,7 @@ describe('computeFacets — a single value per dimension', () => {
       stock: { inStock: 1, outOfStock: 0 },
       // Broad-search reliability audit (Oct 2026) — always computed
       // when there's at least one product, same as `stock` above.
-      productKindSplit: { likelyAccessoryOrPart: 0, likelyDevice: 1 },
+      productKindSplit: { likelyAccessoryOrPart: 0, likelyResidentialPhone: 0, likelyDevice: 1 },
     })
     // No categories key — CatalogProduct has no such field anywhere;
     // inventing one would violate the "no fabricar datos" rule.
@@ -196,11 +196,20 @@ describe('computeFacets — productKindSplit: honest device-vs-accessory/part co
       product({ name: 'BATERIA SAMSUNG A05 A055M' }), // part
       product({ name: 'HONOR PLAY 10 64GB + 3GB ELA-LX3 AZUL' }), // device
     ])
-    expect(facets?.productKindSplit).toEqual({ likelyAccessoryOrPart: 2, likelyDevice: 2 })
+    expect(facets?.productKindSplit).toEqual({ likelyAccessoryOrPart: 2, likelyResidentialPhone: 0, likelyDevice: 2 })
   })
 
   it('is always present whenever there is at least one product — same discipline as `stock`', () => {
     const facets = computeFacets([product()])
     expect(facets?.productKindSplit).toBeDefined()
+  })
+
+  it('CRITICAL (Mission D): a residential/landline phone is its own bucket, never counted as likelyDevice (a smartphone) — real names from the "Consultas KC" catalog', () => {
+    const facets = computeFacets([
+      product({ name: 'TELEFONO RESIDENCIAL DE SIM CARD HUAWEI' }), // residential phone, real brand-like word "HUAWEI" present
+      product({ name: 'SAMSUNG A26 5G 128GB + 6GB NEGRO' }), // real smartphone
+      product({ name: 'PANTALLA SAMSUNG A07' }), // part
+    ])
+    expect(facets?.productKindSplit).toEqual({ likelyAccessoryOrPart: 1, likelyResidentialPhone: 1, likelyDevice: 1 })
   })
 })

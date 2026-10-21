@@ -178,13 +178,31 @@ function bareNumberMatchesUnit(a: string, b: string): boolean {
   return false
 }
 
+/** A short letter-prefix + digit-suffix token ("a26", "a07", "s24") —
+ *  the shape of a real model code, as opposed to a brand word or a
+ *  bare qualifier. */
+const MODEL_CODE_TOKEN_PATTERN = /^[a-z]{1,3}\d{1,4}$/
+
 /** True when `token` matches `candidateToken` exactly, as a substring,
  *  via the bare-number/unit bridge, or within the length-scaled
- *  Levenshtein threshold. */
+ *  Levenshtein threshold.
+ *
+ *  Substring containment is suppressed when BOTH tokens are shaped like
+ *  model codes: "a26" must never match "a2603" just because it's a
+ *  textual prefix of it — confirmed directly against the real catalog
+ *  that an unrelated iPad part's "A2603" fragment would otherwise match
+ *  a query for the real Samsung "A26". Two different model codes are
+ *  two different products. Exact equality and the fuzzy/typo-tolerance
+ *  fallback below still apply unchanged — this only removes the one
+ *  substring shortcut that conflated a short code with a longer,
+ *  different one. */
 function tokenMatches(token: string, candidateToken: string): boolean {
   if (token === candidateToken) return true
-  if (token.length >= 3 && candidateToken.includes(token)) return true
-  if (candidateToken.length >= 3 && token.includes(candidateToken)) return true
+  const bothModelCodes = MODEL_CODE_TOKEN_PATTERN.test(token) && MODEL_CODE_TOKEN_PATTERN.test(candidateToken)
+  if (!bothModelCodes) {
+    if (token.length >= 3 && candidateToken.includes(token)) return true
+    if (candidateToken.length >= 3 && token.includes(candidateToken)) return true
+  }
   if (bareNumberMatchesUnit(token, candidateToken)) return true
   return levenshtein(token, candidateToken) <= fuzzyThreshold(Math.max(token.length, candidateToken.length))
 }

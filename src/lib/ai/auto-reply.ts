@@ -3,7 +3,7 @@ import { loadAiConfig } from './config'
 import { buildConversationContext, latestCustomerMessageId } from './context'
 import { retrieveKnowledge, accountHasKnowledgeBase } from './knowledge'
 import { generateReply } from './generate'
-import { buildSystemPrompt, buildSystemPromptBlocks, getSystemTimeContext } from './defaults'
+import { buildSystemPrompt, buildSystemPromptBlocks, getSystemTimeContext, MAX_TOOL_CALLS_PER_GENERATE } from './defaults'
 import { buildHandoffSummary } from './handoff'
 import { logAiUsage, deriveCatalogExternalFlags, classifyGenerateFailure } from './usage'
 import { latestUserMessage } from './query'
@@ -17,6 +17,7 @@ import { createResolverCache, hasActiveCatalogSources } from './catalog/resolver
 import { CATALOG_TOOL_SPECS, GET_PRODUCT_MEDIA, executeCatalogTool } from './tools/catalog-tools'
 import { catalogContextToPromptText, updateCatalogContext, type CatalogTurnContext } from './catalog/context'
 import { verifyCommercialClaims } from './catalog/verify-claims'
+import { buildCatalogSearchTrace } from './catalog/observability'
 import type { AiConfig, ToolExecutor } from './types'
 import type { SupabaseClient } from '@supabase/supabase-js'
 
@@ -567,13 +568,27 @@ async function processOneTurn(ctx: {
   // handoff by itself — "informar de la limitación" is enough; the
   // conversation continues normally on the customer's next message.
   let text = rawText
+  // Fase 7 (observability) — undefined/NULL unless verification actually
+  // ran this turn, same "did not run" discipline as every other
+  // optional usage.ts field (see LogAiUsageArgs.commercialValidationPassed).
+  let commercialValidationPassed: boolean | undefined
+  let commercialValidationIssueCount: number | undefined
   if (routing.useCatalog && text && !handoff) {
     const verification = verifyCommercialClaims(text, toolCalls, previousCatalogContext)
+    commercialValidationPassed = verification.verified
+    commercialValidationIssueCount = verification.issues.length
     if (!verification.verified) {
       console.warn('[ai auto-reply] unverified commercial claim(s) — replacing reply with an honest holding message:', verification.issues)
       text = 'Necesito confirmar esa información con el inventario antes de dártela con certeza — dame un momento. 😊'
     }
   }
+
+  // Fase 7 (observability, Mission D audit) — derived AFTER the fact
+  // from this turn's own toolCalls, never a new query. See
+  // catalog/observability.ts's module doc for why this makes a silent
+  // "no Samsung smartphones" or a budget-exhausted turn diagnosable
+  // later instead of leaving only an ephemeral console.warn.
+  const { entries: catalogSearchTrace, overallStatus: searchCompletionStatus } = buildCatalogSearchTrace(toolCalls)
 
   // Fold this turn's tool results into the cross-turn catalog context
   // (AI_Catalog_Fix_Kit FASE 5/6/9) so a later short follow-up like
@@ -635,6 +650,11 @@ async function processOneTurn(ctx: {
     catalogExternalBlocked,
     finishReason,
     toolTurnsExhausted,
+    catalogSearchTrace: catalogSearchTrace.length > 0 ? catalogSearchTrace : undefined,
+    searchCompletionStatus: searchCompletionStatus ?? undefined,
+    toolCallBudgetMax: routing.useCatalog ? MAX_TOOL_CALLS_PER_GENERATE : undefined,
+    commercialValidationPassed,
+    commercialValidationIssueCount,
   })
 
   if (handoff || !text) {
