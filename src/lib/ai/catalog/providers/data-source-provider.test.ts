@@ -364,3 +364,61 @@ describe('DataSourceCatalogProvider — fallback tier scans the WHOLE data sourc
     expect(result.products).toHaveLength(1)
   })
 })
+
+// ============================================================
+// Broad-search reliability audit (Oct 2026), Phase 3.7 — paginating
+// through the whole data source (above) trades the old fixed 500-row
+// blind spot for unbounded latency if Supabase is slow/degraded across
+// several pages. This proves the time-budget cutoff actually engages
+// and reports the result as honestly partial, never as complete.
+// ============================================================
+describe('DataSourceCatalogProvider — fallback scan time budget: a slow multi-page scan is cut short honestly, never silently presented as complete', () => {
+  it('stops paginating once the time budget is exceeded, and reports hasMore: true / total: null instead of a false "complete" result', async () => {
+    vi.useFakeTimers()
+    try {
+      // Each simulated page "takes" 5s of wall-clock time — the second
+      // page alone pushes elapsed time past the 8s budget, so a THIRD
+      // page must never be fetched.
+      let rangeCalls = 0
+      const db = {
+        // The DB/FTS tier is tried first — empty, non-error, so
+        // searchCatalog falls through to fallbackSearch exactly as the
+        // real "0 literal hits" case does.
+        rpc: async () => ({ data: [], error: null }),
+        from: (table: string) => {
+          if (table !== 'ai_catalog_products') throw new Error(`unexpected table ${table}`)
+          const api = {
+            select: () => api,
+            eq: () => api,
+            order: () => api,
+            range: async (from: number, to: number) => {
+              rangeCalls++
+              vi.advanceTimersByTime(5_000)
+              // Always a FULL page (1000 rows) — an endlessly "more
+              // data available" data source, so the loop would keep
+              // going forever if the time budget didn't cut it off.
+              const page = Array.from({ length: 1000 }, (_, i) =>
+                row({ id: `row-${from + i}`, source_product_id: `row-${from + i}`, name: `PRODUCTO ${from + i}` }),
+              )
+              void to
+              return { data: page, error: null }
+            },
+          }
+          return api
+        },
+      } as unknown as SupabaseClient
+      const provider = new DataSourceCatalogProvider(db, 'acct-1', 'ds-1', 'PRUEBA')
+
+      const result = await provider.searchCatalog({ query: 'nonexistent-term-forces-fallback' })
+
+      // Cut off after exactly 2 pages (0ms, then 5s, then the 3rd
+      // iteration's pre-check sees 10s > 8s budget and stops BEFORE a
+      // 3rd network call).
+      expect(rangeCalls).toBe(2)
+      expect(result.hasMore).toBe(true) // never silently "complete"
+      expect(result.total).toBeNull() // honestly unknown, not a false count of only what was scanned
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+})

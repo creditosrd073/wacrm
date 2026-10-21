@@ -50,6 +50,19 @@ const FALLBACK_SCAN_PAGE_SIZE = 1000
  *  tier needs a different design (e.g. a server-side trigram/fuzzy
  *  index), not a larger constant here. */
 const FALLBACK_SCAN_MAX_ROWS = 10_000
+/** Wall-clock budget for the WHOLE paginated scan, not any one page —
+ *  broad-search reliability audit (Oct 2026), Phase 3.7: paginating
+ *  through the whole data source (above) trades the old fixed 500-row
+ *  blind spot for unbounded latency if Supabase itself is slow/
+ *  degraded, since this tier can now issue several round trips instead
+ *  of one. 8s leaves comfortable room under the provider call's own
+ *  ~30s timeout (defaults.ts::aiRequestTimeoutMs) for the rest of that
+ *  turn's work, while still covering a real multi-page scan (the real
+ *  1,143-row catalog needs only 2 pages). Hitting this cuts the scan
+ *  short HONESTLY — `hasMore` is forced `true` in that case (see
+ *  `fallbackSearch` below), never silently presented as the complete
+ *  catalog. */
+const FALLBACK_SCAN_TIME_BUDGET_MS = 8_000
 
 interface CatalogProductRow {
   id: string
@@ -187,7 +200,19 @@ export class DataSourceCatalogProvider implements CatalogProvider {
     // stable (ties keep INPUT order), an undeterministic scan would
     // make pagination within this tier flaky across separate calls.
     const allRows: CatalogProductRow[] = []
+    const scanStartedAt = Date.now()
+    // True only if the time budget cut the scan short WHILE more pages
+    // likely remained — never set just because the loop finished
+    // normally (page.length < FALLBACK_SCAN_PAGE_SIZE, or MAX_ROWS).
+    let scanIncomplete = false
     for (let from = 0; from < FALLBACK_SCAN_MAX_ROWS; from += FALLBACK_SCAN_PAGE_SIZE) {
+      if (Date.now() - scanStartedAt > FALLBACK_SCAN_TIME_BUDGET_MS) {
+        console.warn(
+          `[catalog] fallback scan time budget (${FALLBACK_SCAN_TIME_BUDGET_MS}ms) exceeded after ${allRows.length} rows — reporting as partial, never as complete`,
+        )
+        scanIncomplete = true
+        break
+      }
       const { data, error } = await this.db
         .from('ai_catalog_products')
         .select('*')
@@ -225,7 +250,15 @@ export class DataSourceCatalogProvider implements CatalogProvider {
     // `total` now reflects the WHOLE data source (paginated above), not
     // just a fixed first slice — honestly bounded only by
     // FALLBACK_SCAN_MAX_ROWS, a sanity backstop no real catalog has hit.
-    return { products: page, total: filtered.length, hasMore: offset + page.length < filtered.length }
+    // `scanIncomplete` (the time-budget cutoff) forces `hasMore: true`
+    // regardless of the local count — `filtered`/`total` only reflect
+    // what was actually scanned before the cutoff, so presenting them
+    // as the complete catalog would be dishonest.
+    return {
+      products: page,
+      total: scanIncomplete ? null : filtered.length,
+      hasMore: scanIncomplete || offset + page.length < filtered.length,
+    }
   }
 
   async getProduct(nativeId: string): Promise<CatalogProduct | null> {
