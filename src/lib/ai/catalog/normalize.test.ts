@@ -217,6 +217,21 @@ describe('rankBySignificantTokens — subjective qualifiers do not veto real mat
     expect(ranked.length).toBe(2)
     expect(ranked.every((r) => r.item.name.includes('LAPTOP'))).toBe(true)
   })
+
+  it('CRITICAL: a model-code query ("a26") must NOT match a longer, unrelated code ("a2603") — real catalog audit (Oct 2026)', () => {
+    // Taken verbatim from a direct, read-only query against the real
+    // "Consultas KC" catalog: searching "A26" (the real Samsung A26)
+    // also textually contains "A2603", an unrelated iPad touch
+    // digitizer part's SKU-ish fragment. Two different model codes are
+    // two different products — this must never be presented as a match.
+    const realCatalog = [
+      { name: 'SAMSUNG A26 5G 128GB + 6GB NEGRO' },
+      { name: 'Touch Screen Digitizer For iPad 9 10.2 9th Gen A2603 A2604 A2602 2021' },
+    ]
+    const ranked = rankBySignificantTokens('a26', realCatalog, text)
+    expect(ranked.length).toBe(1)
+    expect(ranked[0].item.name).toBe('SAMSUNG A26 5G 128GB + 6GB NEGRO')
+  })
 })
 
 // ============================================================

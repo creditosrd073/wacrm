@@ -99,6 +99,26 @@ export function dataSourceProviderKey(dataSourceId: string): string {
   return `ds_${dataSourceId}`
 }
 
+/** A short letter-prefix + digit-suffix token ("a26", "a07", "s24") —
+ *  the shape of a real model code. Audit (Oct 2026): confirmed directly
+ *  against the real "Consultas KC" catalog that a bare query like "A26"
+ *  returns, among real Samsung A26 rows, an UNRELATED iPad touch
+ *  digitizer part whose name contains "A2603" — migration 047's
+ *  `name ILIKE '%A26%'` is a plain substring match, so it can't tell a
+ *  real model code from one that's merely a prefix of a longer,
+ *  different code. Two different model codes must never be presented
+ *  as the same product (the mandatory "A26, A36, A37, A56" test case). */
+const MODEL_CODE_QUERY_PATTERN = /^[a-z]{1,3}\d{1,4}$/i
+
+/** True when `token` appears in `name` at a genuine word boundary —
+ *  bounded by the string's edges or a non-alphanumeric character on
+ *  each side — never merely as a substring of a longer alphanumeric
+ *  run (so "a26" matches "SAMSUNG A26 5G" but not "iPad...A2603"). */
+function hasWordBoundaryMatch(name: string, token: string): boolean {
+  const escaped = token.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+  return new RegExp(`(^|[^a-z0-9])${escaped}($|[^a-z0-9])`, 'i').test(name)
+}
+
 function rowToProduct(row: CatalogProductRow, providerKey: string, label: string): CatalogProduct {
   return toCatalogProduct({
     id: encodeCatalogId(providerKey, row.source_product_id),
@@ -154,15 +174,40 @@ export class DataSourceCatalogProvider implements CatalogProvider {
       return { products: [], total: null, hasMore: false, hadError: true }
     }
     const rows = (data ?? []) as CatalogProductRowWithTotal[]
+    const trimmedQuery = (args.query ?? '').trim()
+    const isModelCodeQuery = MODEL_CODE_QUERY_PATTERN.test(trimmedQuery)
     if (rows.length > 0) {
       const total = Number(rows[0].total_count ?? rows.length)
-      return {
-        products: rows.map((r) => rowToProduct(r, this.key, this.label)),
-        total,
-        hasMore: offset + rows.length < total,
+      const hasMoreFromDb = offset + rows.length < total
+      if (!isModelCodeQuery) {
+        return { products: rows.map((r) => rowToProduct(r, this.key, this.label)), total, hasMore: hasMoreFromDb }
       }
+      // ILIKE's plain substring match let a model-code query match a
+      // longer, unrelated code — drop rows that aren't a genuine
+      // word-boundary hit before this ever reaches the model.
+      const boundaryMatched = rows.filter((r) => hasWordBoundaryMatch(r.name, trimmedQuery))
+      const removed = rows.length - boundaryMatched.length
+      if (boundaryMatched.length > 0) {
+        if (removed === 0) {
+          return { products: boundaryMatched.map((r) => rowToProduct(r, this.key, this.label)), total, hasMore: hasMoreFromDb }
+        }
+        if (!hasMoreFromDb) {
+          // Last/only page — the exact post-filter total is still knowable.
+          return {
+            products: boundaryMatched.map((r) => rowToProduct(r, this.key, this.label)),
+            total: total - removed,
+            hasMore: false,
+          }
+        }
+        // More pages exist AND this page needed filtering — later pages
+        // may hide the same false-positive shape, so the true total is
+        // no longer reliably known. Honest "partial", never a wrong number.
+        return { products: boundaryMatched.map((r) => rowToProduct(r, this.key, this.label)), total: null, hasMore: true }
+      }
+      // Every row on this page was a false positive — fall through to
+      // the tolerant tier instead of reporting "nothing found" outright.
     }
-    if (!args.query || !args.query.trim()) {
+    if (!args.query || !trimmedQuery) {
       return { products: [], total: 0, hasMore: false }
     }
 

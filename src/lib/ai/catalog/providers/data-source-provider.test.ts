@@ -149,6 +149,60 @@ describe('DataSourceCatalogProvider.searchCatalog — DB tier pagination', () =>
   })
 })
 
+describe('DataSourceCatalogProvider.searchCatalog — model-code queries never match a longer, unrelated code (real audit, Oct 2026)', () => {
+  it('CRITICAL: "a26" excludes an unrelated "A2603" row even though migration 047\'s ILIKE matched it — real names from the "Consultas KC" catalog', async () => {
+    const realMatch = row({ id: 'r1', source_product_id: 'r1', name: 'SAMSUNG A26 5G 128GB + 6GB NEGRO', total_count: 2 })
+    const falsePositive = row({
+      id: 'r2',
+      source_product_id: 'r2',
+      name: 'Touch Screen Digitizer For iPad 9 10.2 9th Gen A2603 A2604 A2602 2021',
+      total_count: 2,
+    })
+    const { db } = fakeDb({ rpcRows: [realMatch, falsePositive] })
+    const provider = new DataSourceCatalogProvider(db, 'acct-1', 'ds-1', 'PRUEBA')
+
+    const result = await provider.searchCatalog({ query: 'a26', limit: 10, offset: 0 })
+    expect(result.products).toHaveLength(1)
+    expect(result.products[0].name).toBe('SAMSUNG A26 5G 128GB + 6GB NEGRO')
+    // Last/only page (offset+rows=2 === total=2) — the post-filter total
+    // is still exactly knowable: 2 - 1 false positive = 1.
+    expect(result.total).toBe(1)
+    expect(result.hasMore).toBe(false)
+  })
+
+  it('a non-model-code query (a plain brand/word) is never filtered by the word-boundary check', async () => {
+    const rows = [row({ id: 'r1', source_product_id: 'r1', name: 'SAMSUNG A26 5G 128GB + 6GB NEGRO', total_count: 1 })]
+    const { db } = fakeDb({ rpcRows: rows })
+    const provider = new DataSourceCatalogProvider(db, 'acct-1', 'ds-1', 'PRUEBA')
+    const result = await provider.searchCatalog({ query: 'samsung', limit: 10 })
+    expect(result.products).toHaveLength(1)
+    expect(result.total).toBe(1)
+  })
+
+  it('when a filtered page still has MORE pages left, the total becomes honestly unknown rather than wrong', async () => {
+    const realMatch = row({ id: 'r1', source_product_id: 'r1', name: 'SAMSUNG A26 5G 128GB + 6GB NEGRO', total_count: 50 })
+    const falsePositive = row({ id: 'r2', source_product_id: 'r2', name: 'IPAD PART A2603', total_count: 50 })
+    const { db } = fakeDb({ rpcRows: [realMatch, falsePositive] })
+    const provider = new DataSourceCatalogProvider(db, 'acct-1', 'ds-1', 'PRUEBA')
+
+    const result = await provider.searchCatalog({ query: 'a26', limit: 2, offset: 0 })
+    expect(result.products).toHaveLength(1)
+    expect(result.total).toBeNull()
+    expect(result.hasMore).toBe(true)
+  })
+
+  it('if EVERY row on the page is a false positive, falls through to the tolerant fallback tier instead of reporting "not found"', async () => {
+    const onlyFalsePositive = row({ id: 'r2', source_product_id: 'r2', name: 'IPAD PART A2603', total_count: 1 })
+    const realRowInFallbackScan = row({ id: 'r3', source_product_id: 'r3', name: 'SAMSUNG A26 5G 128GB + 6GB AZUL' })
+    const { db } = fakeDb({ rpcRows: [onlyFalsePositive], scanRows: [realRowInFallbackScan] })
+    const provider = new DataSourceCatalogProvider(db, 'acct-1', 'ds-1', 'PRUEBA')
+
+    const result = await provider.searchCatalog({ query: 'a26', limit: 10 })
+    expect(result.products).toHaveLength(1)
+    expect(result.products[0].name).toBe('SAMSUNG A26 5G 128GB + 6GB AZUL')
+  })
+})
+
 describe('DataSourceCatalogProvider.searchCatalog — fallback tier (DB-side FTS found nothing)', () => {
   it('falls through to the tolerant ranker and reports a real total/hasMore for it too', async () => {
     const scanRows = [
