@@ -477,9 +477,10 @@ describe('generateReply — tool calling (OpenAI wire)', () => {
       maxToolTurns: 2,
     })
 
-    // Bounded: exactly maxToolTurns+1 requests, then a safe fallback
-    // reply rather than throwing or hanging.
-    expect(fetchMock.mock.calls.length).toBeLessThanOrEqual(3)
+    // Bounded: maxToolTurns+1 requests, plus the one bounded synthesis
+    // attempt the exhaustion path now makes (broad-search reliability
+    // audit, Oct 2026) — still never hangs or throws.
+    expect(fetchMock.mock.calls.length).toBeLessThanOrEqual(4)
     expect(res.text).toBeTruthy()
   })
 })
@@ -702,8 +703,9 @@ describe('generateReply — Anthropic prompt caching (FASE 8)', () => {
     })
 
     // Bounded exactly as without caching (see the OpenAI-wire equivalent
-    // test above): maxToolTurns+1 requests, then a safe fallback reply.
-    expect(fetchMock.mock.calls.length).toBeLessThanOrEqual(3)
+    // test above): maxToolTurns+1 requests, plus the one bounded
+    // synthesis attempt, then a safe fallback reply.
+    expect(fetchMock.mock.calls.length).toBeLessThanOrEqual(4)
     expect(res.text).toBeTruthy()
   })
 
@@ -1004,16 +1006,21 @@ describe('generateReply — Punto 8, F-2: OpenAI/OpenRouter automatic prompt-cac
 // successful reply.
 // ============================================================
 describe('generateReply — Phase 2/6: tool-call budget (MAX_TOOL_CALLS_PER_GENERATE)', () => {
-  function toolCallsResponse(n: number) {
+  // `turn` lets each simulated response request UNIQUE tool-call
+  // arguments per invocation (`q<turn>-<i>`) — deliberately, so these
+  // budget-focused tests are never accidentally affected by the
+  // separate call-DEDUP feature (identical name+input across turns),
+  // which has its own dedicated tests further down.
+  function toolCallsResponse(n: number, turn: number) {
     return okResponse({
       choices: [
         {
           message: {
             content: null,
             tool_calls: Array.from({ length: n }, (_, i) => ({
-              id: `call_${i}`,
+              id: `call_${turn}_${i}`,
               type: 'function',
-              function: { name: 'search_catalog', arguments: '{}' },
+              function: { name: 'search_catalog', arguments: JSON.stringify({ query: `q${turn}-${i}` }) },
             })),
           },
           finish_reason: 'tool_calls',
@@ -1021,15 +1028,26 @@ describe('generateReply — Phase 2/6: tool-call budget (MAX_TOOL_CALLS_PER_GENE
       ],
     })
   }
-  function anthropicToolCallsResponse(n: number) {
+  function anthropicToolCallsResponse(n: number, turn: number) {
     return okResponse({
-      content: Array.from({ length: n }, (_, i) => ({ type: 'tool_use', id: `toolu_${i}`, name: 'search_catalog', input: {} })),
+      content: Array.from({ length: n }, (_, i) => ({
+        type: 'tool_use',
+        id: `toolu_${turn}_${i}`,
+        name: 'search_catalog',
+        input: { query: `q${turn}-${i}` },
+      })),
       stop_reason: 'tool_use',
     })
   }
+  /** A response with no tool_calls and no text — used for the one
+   *  extra "synthesis attempt" fetch call every exhaustion path now
+   *  makes, when the test wants that attempt to find nothing (falling
+   *  back to the canned string), without needing its own mock branch. */
+  const emptySynthesisResponse = okResponse({ choices: [{ message: { content: null } }] })
 
-  it('OpenAI: the call budget cuts the loop off BEFORE MAX_TOOL_TURNS when the model requests 2 tools per turn — counts calls, not turns', async () => {
-    const fetchMock = vi.fn().mockResolvedValue(toolCallsResponse(2))
+  it('OpenAI: the call budget cuts the loop off BEFORE MAX_TOOL_TURNS when the model requests 2 NEW tools per turn — counts calls, not turns', async () => {
+    let turn = 0
+    const fetchMock = vi.fn().mockImplementation(() => Promise.resolve(toolCallsResponse(2, turn++)))
     vi.stubGlobal('fetch', fetchMock)
     const executeTool = vi.fn().mockResolvedValue({ products: [] })
     const res = await generateReply({
@@ -1042,16 +1060,19 @@ describe('generateReply — Phase 2/6: tool-call budget (MAX_TOOL_CALLS_PER_GENE
       maxToolCalls: 6,
     })
     // 3 turns executed (2+2+2=6, exactly at budget), 4th turn is where
-    // the NEXT 2 would push to 8 > 6 — cut off there, never a 5th fetch.
-    expect(fetchMock).toHaveBeenCalledTimes(4)
+    // the NEXT 2 would push to 8 > 6 — cut off there, THEN one bounded
+    // synthesis attempt (which here finds nothing, since the mock never
+    // returns any text) — 5 fetches total, never a 6th.
+    expect(fetchMock).toHaveBeenCalledTimes(5)
     expect(executeTool).toHaveBeenCalledTimes(6)
     expect(res.toolTurnsExhausted).toBe(true)
     expect(res.handoff).toBe(true) // the fix: exhaustion now forces handoff
     expect(res.text).toBe('No pude completar esa consulta con la información disponible en este momento.')
   })
 
-  it('Anthropic: the call budget cuts the loop off BEFORE MAX_TOOL_TURNS when the model requests 2 tools per turn', async () => {
-    const fetchMock = vi.fn().mockResolvedValue(anthropicToolCallsResponse(2))
+  it('Anthropic: the call budget cuts the loop off BEFORE MAX_TOOL_TURNS when the model requests 2 NEW tools per turn', async () => {
+    let turn = 0
+    const fetchMock = vi.fn().mockImplementation(() => Promise.resolve(anthropicToolCallsResponse(2, turn++)))
     vi.stubGlobal('fetch', fetchMock)
     const executeTool = vi.fn().mockResolvedValue({ products: [] })
     const res = await generateReply({
@@ -1063,17 +1084,18 @@ describe('generateReply — Phase 2/6: tool-call budget (MAX_TOOL_CALLS_PER_GENE
       maxToolTurns: 10,
       maxToolCalls: 6,
     })
-    expect(fetchMock).toHaveBeenCalledTimes(4)
+    expect(fetchMock).toHaveBeenCalledTimes(5)
     expect(executeTool).toHaveBeenCalledTimes(6)
     expect(res.toolTurnsExhausted).toBe(true)
     expect(res.handoff).toBe(true)
     expect(res.text).toBe('No pude completar esa consulta con la información disponible en este momento.')
   })
 
-  it('OpenAI: several tools requested in ONE turn count individually — none of them execute once the batch alone would exceed the budget', async () => {
+  it('OpenAI: several NEW tools requested in ONE turn count individually — none of them execute once the batch alone would exceed the budget', async () => {
     const fetchMock = vi.fn()
-      .mockResolvedValueOnce(toolCallsResponse(5)) // turn 0: 5 calls, under the 6 budget — executes
-      .mockResolvedValueOnce(toolCallsResponse(3)) // turn 1: 5+3=8 > 6 — must NOT execute any of these 3
+      .mockResolvedValueOnce(toolCallsResponse(5, 0)) // turn 0: 5 NEW calls, under the 6 budget — executes
+      .mockResolvedValueOnce(toolCallsResponse(3, 1)) // turn 1: 5+3=8 > 6 — must NOT execute any of these 3
+      .mockResolvedValueOnce(emptySynthesisResponse) // the one bounded synthesis attempt — finds nothing
     vi.stubGlobal('fetch', fetchMock)
     const executeTool = vi.fn().mockResolvedValue({ products: [] })
     const res = await generateReply({
@@ -1085,7 +1107,7 @@ describe('generateReply — Phase 2/6: tool-call budget (MAX_TOOL_CALLS_PER_GENE
       maxToolTurns: 10,
       maxToolCalls: 6,
     })
-    expect(fetchMock).toHaveBeenCalledTimes(2)
+    expect(fetchMock).toHaveBeenCalledTimes(3)
     // Exactly the 5 from turn 0 — the 3 from turn 1 were never executed.
     expect(executeTool).toHaveBeenCalledTimes(5)
     expect(res.toolCalls).toHaveLength(5)
@@ -1094,7 +1116,8 @@ describe('generateReply — Phase 2/6: tool-call budget (MAX_TOOL_CALLS_PER_GENE
   })
 
   it('OpenAI: the PRE-EXISTING MAX_TOOL_TURNS cutoff now ALSO forces handoff: true end-to-end (previously it did not — the confirmed stuck-reply bug)', async () => {
-    const fetchMock = vi.fn().mockResolvedValue(toolCallsResponse(1))
+    let turn = 0
+    const fetchMock = vi.fn().mockImplementation(() => Promise.resolve(toolCallsResponse(1, turn++)))
     vi.stubGlobal('fetch', fetchMock)
     const res = await generateReply({
       config: config({ provider: 'openai' }),
@@ -1110,5 +1133,117 @@ describe('generateReply — Phase 2/6: tool-call budget (MAX_TOOL_CALLS_PER_GENE
     // "Un momento..." string was reported as a plain successful reply.
     expect(res.handoff).toBe(true)
     expect(res.text).not.toBe('Un momento, permíteme confirmar esa información.')
+  })
+
+  // ============================================================
+  // Broad-search reliability audit (Oct 2026) — call deduplication:
+  // "evitar búsquedas repetidas con los mismos argumentos" / "reutilizar
+  // resultados ya obtenidos cuando sean válidos".
+  // ============================================================
+  it('OpenAI: a tool call repeated with the EXACT SAME arguments across turns is free — reuses the cached result, never re-invokes executeTool, never spends budget', async () => {
+    // EVERY turn requests the SAME search_catalog("samsung") call —
+    // deliberately NOT unique per turn, unlike the budget tests above.
+    const repeatedResponse = okResponse({
+      choices: [{
+        message: { content: null, tool_calls: [{ id: 'c', type: 'function', function: { name: 'search_catalog', arguments: '{"query":"samsung"}' } }] },
+        finish_reason: 'tool_calls',
+      }],
+    })
+    const fetchMock = vi.fn().mockResolvedValue(repeatedResponse)
+    vi.stubGlobal('fetch', fetchMock)
+    const executeTool = vi.fn().mockResolvedValue({ products: ['one result'] })
+    const res = await generateReply({
+      config: config({ provider: 'openai' }),
+      systemPrompt: 'sys',
+      messages: [{ role: 'user', content: 'busca samsung' }],
+      tools: TOOL_SPECS,
+      executeTool,
+      maxToolTurns: 3, // the TURN cap (not the call budget) is what stops this, proving dedup kept the budget from ever being the cause
+      maxToolCalls: 6,
+    })
+    // executeTool is the real, costly work (a Supabase/ERP round trip) —
+    // called exactly ONCE despite the model "requesting" it on every
+    // one of the turns below.
+    expect(executeTool).toHaveBeenCalledTimes(1)
+    // toolCallLog still records one entry per turn (what the model SAW
+    // each time) — only the underlying work was deduplicated.
+    expect(res.toolCalls.length).toBeGreaterThan(1)
+    expect(res.toolCalls.every((c) => c.result && (c.result as { products: string[] }).products[0] === 'one result')).toBe(true)
+    // Cut off by maxToolTurns=3, never by the call budget (6) — proves
+    // the repeated call never consumed it.
+    expect(res.toolTurnsExhausted).toBe(true)
+  })
+
+  // ============================================================
+  // Broad-search reliability audit (Oct 2026) — exhaustion recovery:
+  // "aprovechar los resultados parciales... no devolver un mensaje
+  // genérico como si la búsqueda hubiese terminado correctamente".
+  // ============================================================
+  it('OpenAI: when the budget is exhausted but real partial results were gathered, ONE bounded synthesis call answers honestly instead of handing off', async () => {
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(toolCallsResponse(6, 0)) // turn 0: 6 calls, exactly at budget
+      .mockResolvedValueOnce(toolCallsResponse(1, 1)) // turn 1: 6+1=7 > 6 — exhausted
+      // The one bounded synthesis call — no `tools` in ITS own request
+      // body, but the mock doesn't need to inspect that; it just needs
+      // to answer with real text this time.
+      .mockResolvedValueOnce(okResponse({ choices: [{ message: { content: 'Encontré 2 Samsung en stock, pero no pude revisar el resto — ¿quieres que siga buscando?' } }] }))
+    vi.stubGlobal('fetch', fetchMock)
+    const res = await generateReply({
+      config: config({ provider: 'openai' }),
+      systemPrompt: 'sys',
+      messages: [{ role: 'user', content: 'busca todos los samsung' }],
+      tools: TOOL_SPECS,
+      executeTool: vi.fn().mockResolvedValue({ products: ['a'] }),
+      maxToolTurns: 10,
+      maxToolCalls: 6,
+    })
+    expect(fetchMock).toHaveBeenCalledTimes(3)
+    expect(res.toolTurnsExhausted).toBe(true)
+    expect(res.partialResultsUsed).toBe(true)
+    // The fix: a genuine partial answer means there's nothing to hand
+    // off FOR — never the canned fallback, never forced handoff.
+    expect(res.handoff).toBe(false)
+    expect(res.text).toBe('Encontré 2 Samsung en stock, pero no pude revisar el resto — ¿quieres que siga buscando?')
+  })
+
+  it('Anthropic: the same exhaustion-recovery synthesis path works identically', async () => {
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(anthropicToolCallsResponse(6, 0))
+      .mockResolvedValueOnce(anthropicToolCallsResponse(1, 1))
+      .mockResolvedValueOnce(okResponse({ content: [{ type: 'text', text: 'Encontré resultados parciales, pero no pude completar toda la búsqueda.' }] }))
+    vi.stubGlobal('fetch', fetchMock)
+    const res = await generateReply({
+      config: config({ provider: 'anthropic' }),
+      systemPrompt: 'sys',
+      messages: [{ role: 'user', content: 'busca todos los samsung' }],
+      tools: TOOL_SPECS,
+      executeTool: vi.fn().mockResolvedValue({ products: ['a'] }),
+      maxToolTurns: 10,
+      maxToolCalls: 6,
+    })
+    expect(res.toolTurnsExhausted).toBe(true)
+    expect(res.partialResultsUsed).toBe(true)
+    expect(res.handoff).toBe(false)
+    expect(res.text).toBe('Encontré resultados parciales, pero no pude completar toda la búsqueda.')
+  })
+
+  it('OpenAI: a provider error on the synthesis attempt itself falls back to the canned handoff path, never throws', async () => {
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(toolCallsResponse(6, 0))
+      .mockResolvedValueOnce(toolCallsResponse(1, 1))
+      .mockResolvedValueOnce({ ok: false, status: 500, json: async () => ({ error: { message: 'boom' } }) } as unknown as Response)
+    vi.stubGlobal('fetch', fetchMock)
+    const res = await generateReply({
+      config: config({ provider: 'openai' }),
+      systemPrompt: 'sys',
+      messages: [{ role: 'user', content: 'x' }],
+      tools: TOOL_SPECS,
+      executeTool: vi.fn().mockResolvedValue({ products: ['a'] }),
+      maxToolTurns: 10,
+      maxToolCalls: 6,
+    })
+    expect(res.partialResultsUsed).toBeFalsy()
+    expect(res.handoff).toBe(true)
+    expect(res.text).toBe('No pude completar esa consulta con la información disponible en este momento.')
   })
 })

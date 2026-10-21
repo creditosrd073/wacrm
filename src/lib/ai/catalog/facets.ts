@@ -20,6 +20,7 @@
 // list of every value that could ever exist in the catalog.
 // ============================================================
 
+import { guessBrandFromName, isLikelyAccessoryOrPart } from './classify'
 import type { CatalogProduct } from './types'
 
 /** Cap on how many distinct values one facet reports — keeps the tool
@@ -49,15 +50,41 @@ export interface CatalogStockSummary {
  * There is deliberately NO `categories` field: `CatalogProduct` has no
  * category column anywhere in the provider contract (see catalog/
  * types.ts) — inventing one here would violate the "no fabricar datos"
- * rule this phase was explicitly built to protect.
+ * rule this phase was explicitly built to protect. `brandGuesses` and
+ * `productKindSplit` below (broad-search reliability audit, Oct 2026)
+ * do NOT violate that rule the same way `categories` would have:
+ * neither invents a structured field that doesn't exist — both are
+ * computed from the real `name` text already on the product, clearly
+ * labeled as a guess/heuristic (never merged into a "confirmed data"
+ * field like `brands`), for the specific, demonstrated case of a real
+ * data source where `brand` is null on every row and roughly half the
+ * catalog is repair parts with nothing else distinguishing them.
  */
 export interface CatalogFacets {
   brands?: string[]
+  /** Broad-search reliability audit (Oct 2026) — a HEURISTIC fallback,
+   *  computed from each product's real `name` text (catalog/classify.ts),
+   *  used ONLY when `brands` above is absent because every product in
+   *  this result has a null `brand` column — confirmed the real state
+   *  of the live "Consultas KC" data source, which has no brand data at
+   *  all. Never merged into `brands` itself and never present alongside
+   *  it, so a reader can never mistake a guess for confirmed data. */
+  brandGuesses?: string[]
   colors?: string[]
   capacities?: string[]
   sizes?: string[]
   priceRange?: CatalogPriceRange
   stock?: CatalogStockSummary
+  /** Broad-search reliability audit (Oct 2026) — how many of THESE
+   *  results look like repair parts/accessories vs. not, by the same
+   *  heuristic as `is_likely_accessory_or_part` on each product
+   *  (catalog/classify.ts). Lets the agent tell the customer honestly
+   *  that e.g. "most of what matched looks like repair parts, not
+   *  phones" instead of presenting a parts-polluted list as a clean
+   *  device listing. `likelyDevice` is a NEGATIVE-signal count (did
+   *  NOT match a known part/accessory keyword) — never a positive
+   *  confirmation every one of those is actually a phone. */
+  productKindSplit?: { likelyAccessoryOrPart: number; likelyDevice: number }
 }
 
 function distinctSorted(values: (string | null | undefined)[]): string[] | undefined {
@@ -82,7 +109,16 @@ export function computeFacets(products: CatalogProduct[]): CatalogFacets | undef
   const facets: CatalogFacets = {}
 
   const brands = distinctSorted(products.map((p) => p.brand))
-  if (brands) facets.brands = brands
+  if (brands) {
+    facets.brands = brands
+  } else {
+    // Real `brand` data is absent across this whole result — fall back
+    // to a clearly-labeled guess from the real name text, rather than
+    // leaving the agent with zero brand signal at all (see this file's
+    // `brandGuesses` doc for why this never coexists with `brands`).
+    const brandGuesses = distinctSorted(products.map((p) => guessBrandFromName(p.name)))
+    if (brandGuesses) facets.brandGuesses = brandGuesses
+  }
 
   const colors = distinctSorted(products.flatMap((p) => p.colors))
   if (colors) facets.colors = colors
@@ -107,6 +143,9 @@ export function computeFacets(products: CatalogProduct[]): CatalogFacets | undef
   // stock.
   const inStock = products.filter((p) => p.available).length
   facets.stock = { inStock, outOfStock: products.length - inStock }
+
+  const likelyAccessoryOrPart = products.filter((p) => isLikelyAccessoryOrPart(p.name)).length
+  facets.productKindSplit = { likelyAccessoryOrPart, likelyDevice: products.length - likelyAccessoryOrPart }
 
   return facets
 }

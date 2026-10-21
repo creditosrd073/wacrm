@@ -1,0 +1,71 @@
+import { describe, it, expect } from 'vitest'
+import { isLikelyAccessoryOrPart, guessBrandFromName } from './classify'
+
+// ============================================================
+// Broad-search reliability audit (Oct 2026) — every fixture name below
+// is taken VERBATIM from a direct, read-only query against the real
+// "Consultas KC" production catalog (confirmed: brand is NULL on every
+// row there, and ~51% of a 1000-row sample are repair parts/
+// accessories, not sellable devices) — not invented examples.
+// ============================================================
+
+describe('isLikelyAccessoryOrPart', () => {
+  it('classifies real repair-part names from the production catalog as accessory/part', () => {
+    const parts = [
+      'PANTALLA SAMSUNG A07',
+      'BATERIA SAMSUNG A05 A055M',
+      'CABLE SAMSUNG ORIGINAL USB-C TO USB-C',
+      'FLEX DE MICROFONO Y AUXILIAR SAMSUNG J8 J810',
+      'CONECTOR DE FLEX SAMSUNG A50',
+      'CONTROL REMOTO TV SAMSUNG BN59-01315A',
+      'CRISTAL DE CAMARA TRASERA SAMSUNG NOTE 20 ULTRA',
+      'BASE DE CARGA SAMSUNG A50',
+      'FUENTE USB-C SAMSUNG 45W',
+    ]
+    for (const name of parts) expect(isLikelyAccessoryOrPart(name)).toBe(true)
+  })
+
+  it('does NOT classify real sellable-phone names from the production catalog as accessory/part', () => {
+    const devices = [
+      'MOTOROLA G06 64GB + 4GB NARANJA',
+      'HONOR PLAY 10 64GB + 3GB ELA-LX3 AZUL',
+      'SAMSUNG A16 128GB + 4GB GRIS',
+      'INFINIX SMART 20 64GB + 4GB AZUL',
+      'M-HORSE S26 ULTRA MAX 128GB + 6GB GRIS',
+      'TV SAMSUNG 65 UHD U7900FD',
+    ]
+    for (const name of devices) expect(isLikelyAccessoryOrPart(name)).toBe(false)
+  })
+
+  it('never positively asserts "device" — only a negative, narrow signal', () => {
+    // An unrelated/ambiguous name is simply unclassified (false), never
+    // a claim it IS a device — see the module's own doc on why.
+    expect(isLikelyAccessoryOrPart('ALGO NUNCA VISTO XYZ123')).toBe(false)
+  })
+})
+
+describe('guessBrandFromName', () => {
+  it('guesses the real brand from plain device names', () => {
+    expect(guessBrandFromName('MOTOROLA G06 64GB + 4GB NARANJA')).toBe('MOTOROLA')
+    expect(guessBrandFromName('SAMSUNG A16 128GB + 4GB GRIS')).toBe('SAMSUNG')
+    expect(guessBrandFromName('M-HORSE S26 ULTRA MAX 128GB + 6GB GRIS')).toBe('M-HORSE')
+  })
+
+  it('strips a single leading category/part word before guessing', () => {
+    expect(guessBrandFromName('TV SAMSUNG 65 UHD U7900FD')).toBe('SAMSUNG')
+    expect(guessBrandFromName('PANTALLA SAMSUNG A07')).toBe('SAMSUNG')
+    expect(guessBrandFromName('BATERIA SAMSUNG A05 A055M')).toBe('SAMSUNG')
+  })
+
+  it('strips TWO leading phrases in a row ("CONTROL REMOTO TV SAMSUNG...")', () => {
+    expect(guessBrandFromName('CONTROL REMOTO TV SAMSUNG BN59-01315A')).toBe('SAMSUNG')
+  })
+
+  it('returns null rather than guessing when the next token is a model/capacity code, not a brand word', () => {
+    expect(guessBrandFromName('FUENTE 12V 5AMP - ASTRO SAMSUNG HTLVISION')).toBeNull()
+  })
+
+  it('returns null for a name with nothing plausible left after stripping', () => {
+    expect(guessBrandFromName('BATERIA')).toBeNull()
+  })
+})

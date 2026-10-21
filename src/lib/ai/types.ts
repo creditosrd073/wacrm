@@ -116,6 +116,17 @@ export interface ProviderResult {
    *  behavior (`generate.ts`'s "Un momento, permíteme confirmar..."
    *  text) is completely unchanged by this field's presence. */
   toolTurnsExhausted?: boolean
+  /** Broad-search reliability audit (Oct 2026) — true when the tool
+   *  budget/turn cap was exhausted (`toolTurnsExhausted: true`) AND a
+   *  bounded, ONE-SHOT follow-up call (no tools attached, so it cannot
+   *  itself loop) successfully synthesized a genuine answer from the
+   *  partial results already gathered — as opposed to the exhaustion
+   *  happening with nothing useful to show. `text` in that case is the
+   *  model's own honest, partial-results answer, not the canned
+   *  fallback string. Always false/absent when `toolTurnsExhausted` is
+   *  falsy. See generate.ts::parseGeneration for how this changes
+   *  whether exhaustion forces a handoff. */
+  partialResultsUsed?: boolean
 }
 
 /** One completed tool call from a provider's internal tool-calling loop
@@ -175,6 +186,8 @@ export interface GenerateResult {
   finishReason?: string
   /** Punto 8, H8-1 — see `ProviderResult.toolTurnsExhausted`. */
   toolTurnsExhausted?: boolean
+  /** See `ProviderResult.partialResultsUsed`. */
+  partialResultsUsed?: boolean
 }
 
 /**

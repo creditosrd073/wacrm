@@ -122,6 +122,15 @@ export async function generateAnthropic(args: ProviderArgs): Promise<ProviderRes
   // several requested in the same response (incremented by
   // `toolUseBlocks.length`, never by 1 per turn — see the loop below).
   let toolCallsMade = 0
+  // Broad-search reliability audit (Oct 2026) — a repeated call with
+  // the SAME name+input within this one generateReply() call reuses
+  // its earlier result instead of re-executing (a real Supabase/ERP
+  // round trip) AND instead of spending another unit of the call
+  // budget — directly closes the "evitar búsquedas repetidas con los
+  // mismos argumentos" / "reutilizar resultados ya obtenidos" gap. Only
+  // ever reused within THIS call; never persisted or shared across
+  // turns/customers (a plain local Map, same lifetime as `toolCallLog`).
+  const callResultCache = new Map<string, unknown>()
   const aggregatedUsage = { prompt: 0, completion: 0, cacheCreation: 0, cacheRead: 0 }
   // Punto 8, H8-1 — the raw stop_reason of the LAST turn actually
   // executed (overwritten every iteration, so the final value reflects
@@ -186,12 +195,19 @@ export async function generateAnthropic(args: ProviderArgs): Promise<ProviderRes
     }
 
     const toolUseBlocks = blocks.filter((b): b is Extract<AnthropicContentBlock, { type: 'tool_use' }> => b.type === 'tool_use')
+    // Broad-search reliability audit (Oct 2026) — a repeat of an
+    // earlier call (same name+input) is free: it reuses callResultCache
+    // instead of spending budget, so it must NOT count toward whether
+    // this turn would exceed it. Only genuinely NEW calls do.
+    const newCallsRequested = toolUseBlocks.filter(
+      (b) => !callResultCache.has(`${b.name}:${JSON.stringify(b.input)}`),
+    ).length
     // Playground/WhatsApp reliability audit (Oct 2026) — a turn can
     // request several tools at once, so the call budget must be checked
     // against what THIS turn would add, not just whether we've already
     // hit it — otherwise a single turn requesting e.g. 4 tools at call
     // 4/6 would silently blow past 6.
-    const wouldExceedCallBudget = toolCallsMade + toolUseBlocks.length > maxCalls
+    const wouldExceedCallBudget = toolCallsMade + newCallsRequested > maxCalls
     // Punto 8, H8-1 — true only on the exact turn where the model still
     // wants a tool but MAX_TOOL_TURNS or MAX_TOOL_CALLS_PER_GENERATE
     // forbids honoring it. Never true when `!executeTool` (no tools were
@@ -204,12 +220,21 @@ export async function generateAnthropic(args: ProviderArgs): Promise<ProviderRes
     if (toolUseBlocks.length > 0 && executeTool && turn < maxTurns && !wouldExceedCallBudget) {
       wireMessages.push({ role: 'assistant', content: blocks })
       const resultBlocks: AnthropicContentBlock[] = []
+      let newCallsThisTurn = 0
       for (const block of toolUseBlocks) {
-        const result = await executeTool({ id: block.id, name: block.name, input: block.input })
+        const cacheKey = `${block.name}:${JSON.stringify(block.input)}`
+        let result: unknown
+        if (callResultCache.has(cacheKey)) {
+          result = callResultCache.get(cacheKey)
+        } else {
+          result = await executeTool({ id: block.id, name: block.name, input: block.input })
+          callResultCache.set(cacheKey, result)
+          newCallsThisTurn++
+        }
         toolCallLog.push({ name: block.name, input: block.input, result })
         resultBlocks.push({ type: 'tool_result', tool_use_id: block.id, content: JSON.stringify(result) })
       }
-      toolCallsMade += toolUseBlocks.length
+      toolCallsMade += newCallsThisTurn
       wireMessages.push({ role: 'user', content: resultBlocks })
       continue // ask the model again with the tool results in context
     }
@@ -234,17 +259,38 @@ export async function generateAnthropic(args: ProviderArgs): Promise<ProviderRes
     if (!text) {
       if (toolCallLog.length > 0) {
         if (toolTurnsExhausted) {
+          console.warn(
+            `[ai/anthropic] tool budget exhausted (turn=${turn}, maxTurns=${maxTurns}, toolCallsMade=${toolCallsMade}, maxCalls=${maxCalls}) — attempting one bounded synthesis of partial results`,
+          )
+          const synthesized = await trySynthesizePartialAnswer(wireMessages, wireSystem, model, apiKey, timeoutMs)
+          if (synthesized) {
+            aggregatedUsage.prompt += synthesized.usage.prompt
+            aggregatedUsage.completion += synthesized.usage.completion
+            return {
+              text: synthesized.text,
+              usage: normalizeUsage({
+                prompt: aggregatedUsage.prompt,
+                completion: aggregatedUsage.completion,
+                cacheCreationInputTokens: sawCacheCreation ? aggregatedUsage.cacheCreation : undefined,
+                cacheReadInputTokens: sawCacheRead ? aggregatedUsage.cacheRead : undefined,
+              }),
+              toolCalls: toolCallLog,
+              finishReason: lastStopReason,
+              toolTurnsExhausted,
+              partialResultsUsed: true,
+            }
+          }
           // Diagnosable termination cause (Playground/WhatsApp
-          // reliability audit, Oct 2026) — never silent. This text is
-          // never sent to a real WhatsApp customer: `generateReply`
-          // forces `handoff: true` whenever `toolTurnsExhausted` is
-          // true, and auto-reply.ts's existing `if (handoff || !text)`
-          // branch hands off instead of sending anything. It's only
+          // reliability audit, Oct 2026) — never silent. Reached only
+          // when the synthesis attempt above ALSO found nothing useful.
+          // This text is never sent to a real WhatsApp customer:
+          // `generateReply` forces `handoff: true` whenever
+          // `toolTurnsExhausted` is true and `partialResultsUsed` isn't,
+          // and auto-reply.ts's existing `if (handoff || !text)` branch
+          // hands off instead of sending anything. It's only
           // user-visible in the Playground/draft tools, where it must
           // not claim the search finished.
-          console.warn(
-            `[ai/anthropic] tool budget exhausted (turn=${turn}, maxTurns=${maxTurns}, toolCallsMade=${toolCallsMade}, maxCalls=${maxCalls}) — handing off instead of reporting success`,
-          )
+          console.warn('[ai/anthropic] synthesis attempt found nothing usable — handing off instead of reporting success')
         }
         return {
           text: toolTurnsExhausted
@@ -260,5 +306,62 @@ export async function generateAnthropic(args: ProviderArgs): Promise<ProviderRes
     }
 
     return { text, usage, toolCalls: toolCallLog, finishReason: lastStopReason, toolTurnsExhausted }
+  }
+}
+
+/**
+ * Broad-search reliability audit (Oct 2026) — ONE bounded, tool-less
+ * follow-up call attempted ONLY when the tool budget/turn cap cut the
+ * model off mid-investigation (`toolTurnsExhausted`) and it had already
+ * gathered at least one real tool result. Reuses the SAME accumulated
+ * `wireMessages` (which already include every tool_use/tool_result pair
+ * from the loop above) plus one explicit, honest nudge — never attaches
+ * `tools`, so this call structurally cannot itself request another tool
+ * or loop further ("no iniciar ciclos ilimitados de recuperación").
+ *
+ * Returns `null` (never throws) on any failure — network error, non-2xx,
+ * or genuinely empty text — so the caller can fall back to the existing
+ * canned-fallback/handoff behavior exactly as before this function
+ * existed.
+ */
+async function trySynthesizePartialAnswer(
+  wireMessages: AnthropicMessage[],
+  wireSystem: string | AnthropicSystemBlock[],
+  model: string,
+  apiKey: string,
+  timeoutMs: number,
+): Promise<{ text: string; usage: { prompt: number; completion: number } } | null> {
+  const nudgedMessages: AnthropicMessage[] = [
+    ...wireMessages,
+    {
+      role: 'user',
+      content:
+        'No pudiste completar la búsqueda dentro del límite de herramientas disponible. Responde ÚNICAMENTE con ' +
+        'información real que ya obtuviste arriba (de los resultados de las herramientas), indicando CLARAMENTE ' +
+        'que es parcial o incompleta — nunca digas que terminaste la búsqueda o que es la lista completa. Si no ' +
+        'tienes ningún dato real y útil para responder, dilo honestamente en vez de inventar algo.',
+    },
+  ]
+  try {
+    const res = await fetch(ANTHROPIC_URL, {
+      method: 'POST',
+      headers: { 'x-api-key': apiKey, 'anthropic-version': ANTHROPIC_VERSION, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ model, system: wireSystem, max_tokens: MAX_OUTPUT_TOKENS, messages: nudgedMessages }),
+      signal: AbortSignal.timeout(timeoutMs),
+    })
+    if (!res.ok) return null
+    const data = (await res.json().catch(() => null)) as AnthropicResponse | null
+    const text = (data?.content ?? [])
+      .filter((b): b is Extract<AnthropicContentBlock, { type: 'text' }> => b.type === 'text')
+      .map((b) => b.text)
+      .join('')
+      .trim()
+    if (!text) return null
+    return {
+      text,
+      usage: { prompt: data?.usage?.input_tokens ?? 0, completion: data?.usage?.output_tokens ?? 0 },
+    }
+  } catch {
+    return null
   }
 }
