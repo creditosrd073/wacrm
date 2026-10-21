@@ -14,6 +14,7 @@ import { AiError, type ChatMessage } from '@/lib/ai/types'
 import { createResolverCache, hasActiveCatalogSources } from '@/lib/ai/catalog/resolver'
 import { CATALOG_TOOL_SPECS, executeCatalogTool } from '@/lib/ai/tools/catalog-tools'
 import { catalogContextToPromptText, updateCatalogContext, type CatalogTurnContext } from '@/lib/ai/catalog/context'
+import { verifyCommercialClaims } from '@/lib/ai/catalog/verify-claims'
 
 // Keep the tested transcript bounded, mirroring the live context window.
 const MAX_TURNS = 20
@@ -188,7 +189,7 @@ export async function POST(request: Request) {
     // was slow" without a new table — just two numbers in one log line.
     const preGenerateMs = Date.now() - requestStartedAt
 
-    const { text, handoff, toolCalls } = await generateReply({
+    const { text: rawText, handoff, toolCalls } = await generateReply({
       config,
       systemPrompt,
       systemPromptBlocks,
@@ -201,6 +202,23 @@ export async function POST(request: Request) {
     usedCatalogForLog = routing.useCatalog
     usedKnowledgeForLog = routing.useKnowledge
     preGenerateMsForLog = preGenerateMs
+
+    // Commercial-claims verification — see auto-reply.ts's identical
+    // check for the full rationale (real incident, Oct 2026). Applied
+    // here too so the Playground shows an admin EXACTLY what a real
+    // customer would receive (this route's own stated purpose), plus
+    // the specific flagged claim(s) as diagnostic metadata — never
+    // shown to a real customer, only useful here for verifying the
+    // agent before turning auto-reply on.
+    let text = rawText
+    let commercialClaimIssues: string[] | undefined
+    if (routing.useCatalog && text && !handoff) {
+      const verification = verifyCommercialClaims(text, toolCalls, incomingCatalogContext)
+      if (!verification.verified) {
+        commercialClaimIssues = verification.issues
+        text = 'Necesito confirmar esa información con el inventario antes de dártela con certeza — dame un momento. 😊'
+      }
+    }
 
     // Same deterministic, server-side resolution auto-reply.ts uses —
     // runs only on the (rare) handoff path, and only against THIS
@@ -239,6 +257,10 @@ export async function POST(request: Request) {
       knowledge_count: knowledge.length,
       tool_calls: toolCalls.map((c) => ({ name: c.name, input: c.input })),
       media,
+      // Only present when a price/quantity claim didn't match this
+      // turn's real data — diagnostic only, for verifying the agent
+      // here; never part of what a real WhatsApp customer receives.
+      ...(commercialClaimIssues ? { commercial_claim_issues: commercialClaimIssues } : {}),
       // Lets an admin SEE the routing decision the request actually
       // made (FASE 5) — this is exactly what the Playground is for:
       // verifying agent behavior before turning auto-reply on.

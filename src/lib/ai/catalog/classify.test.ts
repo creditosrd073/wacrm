@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest'
-import { isLikelyAccessoryOrPart, guessBrandFromName } from './classify'
+import { isLikelyAccessoryOrPart, guessBrandFromName, classifyProductConfidence } from './classify'
 
 // ============================================================
 // Broad-search reliability audit (Oct 2026) — every fixture name below
@@ -67,5 +67,37 @@ describe('guessBrandFromName', () => {
 
   it('returns null for a name with nothing plausible left after stripping', () => {
     expect(guessBrandFromName('BATERIA')).toBeNull()
+  })
+})
+
+// ============================================================
+// Commercial-veracity audit (Oct 2026) — the real incident this
+// closes: a product was treated as a confirmed phone with stock just
+// because its name contained "Samsung"/"A16". classifyProductConfidence
+// must never return 'likely_device' from name-matching alone unless a
+// REAL recognized device pattern (or real brand/model field) backs it.
+// ============================================================
+describe('classifyProductConfidence', () => {
+  it('a real repair part is "accessory_or_part", never anything else, regardless of brand/model fields', () => {
+    expect(classifyProductConfidence({ name: 'PANTALLA SAMSUNG A07' })).toBe('accessory_or_part')
+    expect(classifyProductConfidence({ name: 'PANTALLA SAMSUNG A07', brand: 'Samsung', model: 'A07' })).toBe('accessory_or_part')
+  })
+
+  it('real structured brand/model fields are stronger evidence than any name heuristic — "likely_device"', () => {
+    expect(classifyProductConfidence({ name: 'Algo sin patrón de nombre reconocible', brand: 'Samsung' })).toBe('likely_device')
+    expect(classifyProductConfidence({ name: 'Algo sin patrón de nombre reconocible', model: 'A16' })).toBe('likely_device')
+  })
+
+  it('a real device-naming pattern ("<storage>GB + <ram>GB") is "likely_device" even with no structured fields', () => {
+    expect(classifyProductConfidence({ name: 'MOTOROLA G06 64GB + 4GB NARANJA' })).toBe('likely_device')
+  })
+
+  it('the real incident: a name that merely MENTIONS a brand/model word, with no structured fields and no real device pattern, is "uncertain" — never "likely_device"', () => {
+    expect(classifyProductConfidence({ name: 'Samsung A16' })).toBe('uncertain')
+    expect(classifyProductConfidence({ name: 'Touch Samsung A16 genérico' })).toBe('uncertain')
+  })
+
+  it('blank/whitespace-only brand or model fields are NOT treated as real structured data', () => {
+    expect(classifyProductConfidence({ name: 'Samsung A16', brand: '   ', model: '' })).toBe('uncertain')
   })
 })
