@@ -59,7 +59,17 @@ export const CATALOG_TOOL_SPECS: ToolSpec[] = [
       'Puede incluir además `facets` (brands, colors, capacities, sizes, priceRange, stock) con los valores REALES ' +
       'encontrados entre estos resultados — úsalo para responder "qué marcas/colores/capacidades tienen" o "en qué ' +
       'rango de precios". Si `facets` falta o no incluye una clave, no tienes ese dato confirmado — nunca lo ' +
-      'inventes ni asumas valores típicos de la categoría.',
+      'inventes ni asumas valores típicos de la categoría. ' +
+      'Si `facets.brands` no aparece pero SÍ aparece `facets.brandGuesses`, es una ESTIMACIÓN a partir del nombre ' +
+      'real del producto (no un dato de marca confirmado) — puedes usarla para orientar al cliente, pero acláralo ' +
+      'como una referencia aproximada, nunca como un dato confirmado de marca. ' +
+      'Cada producto incluye `is_likely_accessory_or_part` (heurística sobre el nombre real — NUNCA una categoría ' +
+      'confirmada): `true` significa que el nombre coincide con un repuesto/accesorio conocido (pantalla, batería, ' +
+      'flex, cable, funda, etc.); `false` NO significa que sea un teléfono/TV confirmado, solo que no coincidió con ' +
+      'esos términos. Cuando el cliente pida específicamente teléfonos/televisores (no repuestos ni accesorios), ' +
+      'usa esta señal para excluir de tu respuesta lo que claramente sea un repuesto/accesorio. `facets.' +
+      'productKindSplit` te dice cuántos de estos resultados parecen repuestos/accesorios frente a dispositivos — ' +
+      'si la mayoría son repuestos, dilo honestamente en vez de presentar la lista como si fueran todos teléfonos.',
     inputSchema: {
       type: 'object',
       properties: {

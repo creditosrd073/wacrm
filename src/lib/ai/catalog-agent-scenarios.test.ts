@@ -560,3 +560,129 @@ describe('Full pipeline — a genuine catalog query failure ends the turn cleanl
     expect(text.toLowerCase()).not.toContain('no existe')
   })
 })
+
+// ============================================================
+// Broad-search reliability audit (Oct 2026) — a realistic fixture
+// modeled on the REAL production catalog's own demonstrated shape
+// (confirmed by a direct, read-only query against it): `brand: null`
+// on every row, and roughly half the rows are repair parts/accessories
+// sharing the same brand/model words as the real sellable devices
+// ("PANTALLA SAMSUNG A56" alongside "SAMSUNG A56 128GB NEGRO"). This is
+// its OWN local fake (not the shared `PRODUCTS`/`fakeDb()` above, which
+// other tests in this file depend on unchanged) so it can model that
+// shape precisely without touching anything else.
+// ============================================================
+function rowNullBrand(id: string, name: string, over: Partial<Record<string, unknown>> = {}) {
+  return row(id, name, { brand: null, ...over })
+}
+
+const MIXED_CATALOG = [
+  rowNullBrand('d1', 'SAMSUNG A56 128GB + 6GB NEGRO', { price: 15000, capacity: '128GB' }),
+  rowNullBrand('d2', 'MOTOROLA G06 64GB + 4GB NARANJA', { price: 7000, capacity: '64GB' }),
+  rowNullBrand('d3', 'HONOR PLAY 10 64GB + 3GB AZUL', { price: 6500, capacity: '64GB' }),
+  rowNullBrand('p1', 'PANTALLA SAMSUNG A56', { price: 2500 }),
+  rowNullBrand('p2', 'BATERIA SAMSUNG A56', { price: 800 }),
+  rowNullBrand('p3', 'FLEX DE MICROFONO SAMSUNG A56', { price: 600 }),
+  rowNullBrand('p4', 'CABLE SAMSUNG ORIGINAL USB-C', { price: 400 }),
+  rowNullBrand('p5', 'FUNDA SAMSUNG A56', { price: 300 }),
+]
+
+function fakeDbWithProducts(products: ReturnType<typeof row>[]): SupabaseClient {
+  const db = {
+    from: (table: string) => {
+      if (table === 'catalog_integrations') {
+        const api = { select: () => api, eq: () => api, order: () => api, then: (resolve: (v: unknown) => void) => resolve({ data: [], error: null }) }
+        return api
+      }
+      if (table === 'ai_data_sources') {
+        return {
+          select: () => ({
+            eq: () => ({
+              eq: () => ({
+                in: () =>
+                  Promise.resolve({
+                    data: [{ id: 'ds-1', display_name: 'PRUEBA', status: 'active', usage: 'catalog', priority: 100, is_primary: false, fallback_policy: 'fallback_on_not_found' }],
+                    error: null,
+                  }),
+              }),
+            }),
+          }),
+        }
+      }
+      if (table === 'ai_catalog_products') {
+        const filters: [string, unknown][] = []
+        const api = {
+          select: () => api,
+          eq: (col: string, val: unknown) => { filters.push([col, val]); return api },
+          maybeSingle: () => {
+            const spid = filters.find(([c]) => c === 'source_product_id')?.[1]
+            return Promise.resolve({ data: products.find((p) => p.source_product_id === spid) ?? null, error: null })
+          },
+          order: () => api,
+          limit: () => Promise.resolve({ data: products, error: null }),
+        }
+        return api
+      }
+      throw new Error(`unexpected table ${table}`)
+    },
+    rpc: (fn: string, params: Record<string, unknown>) => {
+      if (fn !== 'search_ai_catalog_products') throw new Error(`unexpected rpc ${fn}`)
+      const query = String(params.p_query ?? '').toLowerCase().trim()
+      const words = query.split(/\s+/).filter(Boolean)
+      const matches = query ? products.filter((p) => words.some((w) => p.name.toLowerCase().includes(w))) : products.slice()
+      const total = matches.length
+      const offset = Number(params.p_offset ?? 0)
+      const limit = Number(params.p_match_count ?? 10)
+      const page = matches.slice(offset, offset + limit).map((p) => ({ ...p, total_count: total }))
+      return Promise.resolve({ data: page, error: null })
+    },
+  }
+  return db as unknown as SupabaseClient
+}
+
+describe('Full pipeline — realistic mixed catalog (null brand, repair parts outnumbering real devices)', () => {
+  it('a specific model query ("A56") returns BOTH the real device and its repair parts — each correctly flagged by is_likely_accessory_or_part, so the agent CAN tell them apart', async () => {
+    const db = fakeDbWithProducts(MIXED_CATALOG)
+    const executeTool = executeCatalogTool(db, 'acct-1')
+    const result = (await executeTool({ id: 'c1', name: 'search_catalog', input: { query: 'A56', limit: 20 } })) as {
+      products: { name: string; is_likely_accessory_or_part: boolean }[]
+    }
+    const device = result.products.find((p) => p.name === 'SAMSUNG A56 128GB + 6GB NEGRO')
+    const part = result.products.find((p) => p.name === 'PANTALLA SAMSUNG A56')
+    expect(device?.is_likely_accessory_or_part).toBe(false)
+    expect(part?.is_likely_accessory_or_part).toBe(true)
+  })
+
+  it('a broad brand query ("samsung") reports facets.brandGuesses (brand is null on every row) and an honest productKindSplit showing parts outnumber the real device', async () => {
+    const db = fakeDbWithProducts(MIXED_CATALOG)
+    const executeTool = executeCatalogTool(db, 'acct-1')
+    const result = (await executeTool({ id: 'c1', name: 'search_catalog', input: { query: 'samsung', limit: 20 } })) as {
+      products: unknown[]
+      facets?: { brandGuesses?: string[]; brands?: string[]; productKindSplit?: { likelyAccessoryOrPart: number; likelyDevice: number } }
+    }
+    // 1 real Samsung device (A56) + 5 Samsung-named parts (p1-p5) = 6.
+    expect(result.products).toHaveLength(6)
+    expect(result.facets?.brands).toBeUndefined()
+    expect(result.facets?.brandGuesses).toEqual(['SAMSUNG'])
+    expect(result.facets?.productKindSplit).toEqual({ likelyAccessoryOrPart: 5, likelyDevice: 1 })
+  })
+
+  it('a device-only query intent ("qué teléfonos tienen") still returns every matching row from a generic query, but the agent has the signal to filter parts out itself', async () => {
+    const db = fakeDbWithProducts(MIXED_CATALOG)
+    const executeTool = executeCatalogTool(db, 'acct-1')
+    // The model would search by brand/model (per SEARCH COVERAGE/CATALOG
+    // TOOLS guidance), not the literal word "teléfono" (confirmed absent
+    // from real device names) — this proves the DATA signal a model
+    // reasoning well would use is present, not that any literal string
+    // query magically filters parts (it never has, by design).
+    const result = (await executeTool({ id: 'c1', name: 'search_catalog', input: { query: 'motorola honor samsung', limit: 20 } })) as {
+      products: { name: string; is_likely_accessory_or_part: boolean }[]
+    }
+    const devices = result.products.filter((p) => !p.is_likely_accessory_or_part)
+    expect(devices.map((p) => p.name).sort()).toEqual([
+      'HONOR PLAY 10 64GB + 3GB AZUL',
+      'MOTOROLA G06 64GB + 4GB NARANJA',
+      'SAMSUNG A56 128GB + 6GB NEGRO',
+    ])
+  })
+})

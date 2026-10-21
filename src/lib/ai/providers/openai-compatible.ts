@@ -95,6 +95,9 @@ export async function generateChatCompletion(
   // Playground/WhatsApp reliability audit (Oct 2026) — see anthropic.ts's
   // identical counter for why this counts individual calls, not turns.
   let toolCallsMade = 0
+  // Broad-search reliability audit (Oct 2026) — see anthropic.ts's
+  // identical cache for why repeated identical calls are free.
+  const callResultCache = new Map<string, unknown>()
 
   const wireMessages: OpenAiMessage[] = [
     { role: 'system', content: systemPrompt },
@@ -181,11 +184,30 @@ export async function generateChatCompletion(
     lastFinishReason = choice?.finish_reason
     const message = choice?.message
     const requestedCalls = message?.tool_calls ?? []
+    // Parsed once, up front, so the budget check below (which must know
+    // which calls are actually NEW before any are executed) and the
+    // execute loop use the exact same parsed input — never re-parsed,
+    // never silently different between the two.
+    const parsedCalls = requestedCalls.map((call) => {
+      let input: unknown = {}
+      try {
+        input = call.function.arguments ? JSON.parse(call.function.arguments) : {}
+      } catch {
+        input = {}
+      }
+      return { call, input }
+    })
+    // Broad-search reliability audit (Oct 2026) — see anthropic.ts's
+    // identical reasoning: a repeat of an earlier call (same name+
+    // input) is free — it must not count toward the budget.
+    const newCallsRequested = parsedCalls.filter(
+      ({ call, input }) => !callResultCache.has(`${call.function.name}:${JSON.stringify(input)}`),
+    ).length
     // Playground/WhatsApp reliability audit (Oct 2026) — see
     // anthropic.ts's identical reasoning: a turn can request several
     // tools at once, so the budget check is against what THIS turn
     // would add, not just whether we've already hit it.
-    const wouldExceedCallBudget = toolCallsMade + requestedCalls.length > maxCalls
+    const wouldExceedCallBudget = toolCallsMade + newCallsRequested > maxCalls
     // H8-1 — true only on the exact turn the model still wants a tool
     // but our own turn cap or call budget forbids continuing.
     const toolTurnsExhausted =
@@ -193,18 +215,21 @@ export async function generateChatCompletion(
 
     if (requestedCalls.length > 0 && executeTool && turn < maxTurns && !wouldExceedCallBudget) {
       wireMessages.push({ role: 'assistant', content: message?.content ?? null, tool_calls: requestedCalls })
-      for (const call of requestedCalls) {
-        let input: unknown = {}
-        try {
-          input = call.function.arguments ? JSON.parse(call.function.arguments) : {}
-        } catch {
-          input = {}
+      let newCallsThisTurn = 0
+      for (const { call, input } of parsedCalls) {
+        const cacheKey = `${call.function.name}:${JSON.stringify(input)}`
+        let result: unknown
+        if (callResultCache.has(cacheKey)) {
+          result = callResultCache.get(cacheKey)
+        } else {
+          result = await executeTool({ id: call.id, name: call.function.name, input })
+          callResultCache.set(cacheKey, result)
+          newCallsThisTurn++
         }
-        const result = await executeTool({ id: call.id, name: call.function.name, input })
         toolCallLog.push({ name: call.function.name, input, result })
         wireMessages.push({ role: 'tool', tool_call_id: call.id, content: JSON.stringify(result) })
       }
-      toolCallsMade += requestedCalls.length
+      toolCallsMade += newCallsThisTurn
       continue // ask the model again with the tool results in context
     }
 
@@ -217,13 +242,31 @@ export async function generateChatCompletion(
       // throwing past the customer.
       if (toolCallLog.length > 0) {
         if (toolTurnsExhausted) {
-          // Diagnosable termination cause — see anthropic.ts's identical
-          // log for why. Never sent to a real WhatsApp customer:
-          // `generateReply` forces `handoff: true` whenever
-          // `toolTurnsExhausted` is true.
           console.warn(
-            `[ai/${endpoint.label}] tool budget exhausted (turn=${turn}, maxTurns=${maxTurns}, toolCallsMade=${toolCallsMade}, maxCalls=${maxCalls}) — handing off instead of reporting success`,
+            `[ai/${endpoint.label}] tool budget exhausted (turn=${turn}, maxTurns=${maxTurns}, toolCallsMade=${toolCallsMade}, maxCalls=${maxCalls}) — attempting one bounded synthesis of partial results`,
           )
+          const synthesized = await trySynthesizePartialAnswer(wireMessages, model, apiKey, timeoutMs, endpoint)
+          if (synthesized) {
+            aggregatedUsage.prompt += synthesized.usage.prompt
+            aggregatedUsage.completion += synthesized.usage.completion
+            return {
+              text: synthesized.text,
+              usage: normalizeUsage({
+                ...aggregatedUsage,
+                cacheReadInputTokens: sawCachedTokens ? aggregatedCachedTokens : undefined,
+              }),
+              toolCalls: toolCallLog,
+              finishReason: lastFinishReason,
+              toolTurnsExhausted,
+              partialResultsUsed: true,
+            }
+          }
+          // Diagnosable termination cause — see anthropic.ts's identical
+          // log for why. Reached only when the synthesis attempt above
+          // ALSO found nothing useful. Never sent to a real WhatsApp
+          // customer: `generateReply` forces `handoff: true` whenever
+          // `toolTurnsExhausted` is true and `partialResultsUsed` isn't.
+          console.warn(`[ai/${endpoint.label}] synthesis attempt found nothing usable — handing off instead of reporting success`)
         }
         return {
           text: toolTurnsExhausted
@@ -251,5 +294,52 @@ export async function generateChatCompletion(
       finishReason: lastFinishReason,
       toolTurnsExhausted,
     }
+  }
+}
+
+/**
+ * Broad-search reliability audit (Oct 2026) — see anthropic.ts's
+ * identical function for the full rationale: ONE bounded, tool-less
+ * follow-up call attempted only when the tool budget/turn cap cut the
+ * model off with at least one real tool result already gathered.
+ * Never attaches `tools`, so this call structurally cannot itself
+ * request another tool. Returns `null` (never throws) on any failure.
+ */
+async function trySynthesizePartialAnswer(
+  wireMessages: OpenAiMessage[],
+  model: string,
+  apiKey: string,
+  timeoutMs: number,
+  endpoint: ChatCompletionsEndpoint,
+): Promise<{ text: string; usage: { prompt: number; completion: number } } | null> {
+  const nudgedMessages: OpenAiMessage[] = [
+    ...wireMessages,
+    {
+      role: 'user',
+      content:
+        'No pudiste completar la búsqueda dentro del límite de herramientas disponible. Responde ÚNICAMENTE con ' +
+        'información real que ya obtuviste arriba (de los resultados de las herramientas), indicando CLARAMENTE ' +
+        'que es parcial o incompleta — nunca digas que terminaste la búsqueda o que es la lista completa. Si no ' +
+        'tienes ningún dato real y útil para responder, dilo honestamente en vez de inventar algo.',
+    },
+  ]
+  try {
+    const res = await fetch(endpoint.url, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${apiKey}`, 'Content-Type': 'application/json', ...endpoint.headers },
+      body: JSON.stringify({ model, messages: nudgedMessages, max_completion_tokens: MAX_OUTPUT_TOKENS }),
+      signal: AbortSignal.timeout(timeoutMs),
+    })
+    if (!res.ok) return null
+    const data = (await res.json().catch(() => null)) as ChatCompletionsResponse | null
+    if (data?.error) return null
+    const text = data?.choices?.[0]?.message?.content
+    if (!text || typeof text !== 'string' || !text.trim()) return null
+    return {
+      text: text.trim(),
+      usage: { prompt: data?.usage?.prompt_tokens ?? 0, completion: data?.usage?.completion_tokens ?? 0 },
+    }
+  } catch {
+    return null
   }
 }
