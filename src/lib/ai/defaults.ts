@@ -324,7 +324,13 @@ function buildSystemPromptParts(args: {
           'names only a brand or attribute ("y de otra marca", "y Samsung", "y TCL", "y de 55") continues the SAME ' +
           'category — search again within that category using the new brand/attribute, do not treat "Samsung" alone ' +
           'as an unrelated new query. Only start a genuinely different search when the customer names a different ' +
-          'category/product (see the CAMBIO DE TEMA instruction in the CATALOG CONTEXT section, when present).',
+          'category/product (see the CAMBIO DE TEMA instruction in the CATALOG CONTEXT section, when present). ' +
+          'A BARE GENERIC CATEGORY QUESTION ("qué celulares tienen", "qué teléfonos hay") may return few or zero ' +
+          'results on the first try, or a result flagged `category_inferred: true` (see the tool\'s own ' +
+          'description) — do NOT retry the same search with equivalent synonyms over and over; that only burns ' +
+          'your tool budget. Never conclude the category does not exist just because it did not match literally — ' +
+          'say so as a search limitation, never as a confirmed absence, and never present one odd/unrepresentative ' +
+          'result as if it were the whole category.',
       ),
     )
 

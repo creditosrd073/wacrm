@@ -78,7 +78,20 @@ export const CATALOG_TOOL_SPECS: ToolSpec[] = [
       'residenciales), usa estas señales para excluir de tu respuesta lo que claramente no sea un smartphone. ' +
       '`facets.productKindSplit` te dice cuántos de estos resultados parecen repuestos/accesorios, teléfonos ' +
       'residenciales, o dispositivos — si la mayoría no son smartphones, dilo honestamente en vez de presentar la ' +
-      'lista como si fueran todos teléfonos.',
+      'lista como si fueran todos teléfonos. ' +
+      'BÚSQUEDAS GENÉRICAS POR CATEGORÍA ("qué celulares tienen", "qué marcas de teléfonos hay") — el catálogo real ' +
+      'puede no tener NINGÚN producto cuyo nombre contenga literalmente "celular"/"teléfono"/"smartphone"; si la ' +
+      'primera búsqueda con esas palabras devuelve 0 resultados, o solo 1 resultado que no parece representativo, ' +
+      'NO repitas la misma palabra con sinónimos equivalentes varias veces — eso agota el presupuesto de ' +
+      'herramientas sin ayudar. En su lugar: la respuesta puede incluir `category_inferred: true`, que indica que ' +
+      'estos productos se seleccionaron por patrón real de nombre/marca/modelo (no por coincidencia textual de la ' +
+      'categoría) — son productos 100% reales con precio/stock reales, pero avísale al cliente que es una ' +
+      'selección aproximada, no necesariamente exhaustiva ni libre de algún error de clasificación ocasional. Si ' +
+      'aun así no hay resultados útiles, NO afirmes que esa categoría no existe en el negocio — dilo honestamente ' +
+      'como una limitación de la búsqueda, nunca como una ausencia confirmada del producto. Nunca presentes UN ' +
+      'solo resultado aislado y poco representativo como si fuera "el único" producto de esa categoría — si algo ' +
+      'se ve raro (p. ej. el nombre sugiere que es un accesorio o algo no relacionado), usa `product_confidence`/ ' +
+      '`is_likely_accessory_or_part` para excluirlo en vez de presentarlo como la respuesta completa.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -230,6 +243,9 @@ export function executeCatalogTool(
             // to report, so a search with no brand/color/etc. data never
             // shows an empty/misleading facets object.
             ...(result.facets ? { facets: result.facets } : {}),
+            // Mission F audit (Oct 2026) — see
+            // CatalogSearchResult.matchedByInferredCategory's doc.
+            ...(result.matchedByInferredCategory ? { category_inferred: true } : {}),
           }
         }
         case GET_PRODUCT: {

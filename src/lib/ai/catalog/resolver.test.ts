@@ -261,6 +261,50 @@ describe('searchCatalog — fallback policy', () => {
     expect(results.products).toEqual([])
     expect(results.hadError).toBeUndefined()
   })
+
+  // ============================================================
+  // Mission F.1/F.2 audit (Oct 2026) — matchedByInferredCategory must
+  // be threaded through the merge loop explicitly (this function
+  // reconstructs its return value field-by-field rather than
+  // spreading one provider's result) — confirmed NOT lost across a
+  // search_all_active fan-out, and confirmed it does not erase the
+  // OTHER provider's normally-matched products just because one of
+  // them resolved structurally.
+  // ============================================================
+  it('search_all_active: matchedByInferredCategory survives the merge when only ONE of two providers set it, and neither provider\'s products are lost', async () => {
+    const { db } = fakeDb([
+      { id: 'ds1', display_name: 'Inferida', status: 'active', usage: 'catalog', priority: 1, is_primary: true, fallback_policy: 'search_all_active' },
+      { id: 'ds2', display_name: 'Normal', status: 'active', usage: 'catalog', priority: 2, is_primary: false, fallback_policy: 'search_all_active' },
+    ])
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    ;(h as any).dataSourceProviderFactory = (id: string) => {
+      if (id === 'ds1') {
+        return {
+          key: 'ds_ds1', label: 'Inferida',
+          async searchCatalog() {
+            return { products: [PRODUCT('ds_ds1:x', 'Inferida')], total: 1, hasMore: false, matchedByInferredCategory: true }
+          },
+          async getProduct() { return null }, async getAvailability() { return null }, async getMedia() { return null },
+        }
+      }
+      return fakeProvider('ds_ds2', [PRODUCT('ds_ds2:x', 'Normal')])
+    }
+
+    const results = await resolver.searchCatalog(db, 'acct-1', { query: 'celulares' })
+    expect(results.products.map((p) => p.source).sort()).toEqual(['Inferida', 'Normal'])
+    expect(results.matchedByInferredCategory).toBe(true)
+  })
+
+  it('matchedByInferredCategory is omitted (never false) when NO provider set it — same discipline as the other additive flags', async () => {
+    const { db } = fakeDb([
+      { id: 'ds1', display_name: 'A', status: 'active', usage: 'catalog', priority: 1, is_primary: true, fallback_policy: 'fallback_on_not_found' },
+    ])
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    ;(h as any).dataSourceProviderFactory = (id: string) => fakeProvider(`ds_${id}`, [PRODUCT('ds_ds1:x', 'A')])
+
+    const results = await resolver.searchCatalog(db, 'acct-1', { query: 'samsung' })
+    expect(results.matchedByInferredCategory).toBeUndefined()
+  })
 })
 
 // ============================================================

@@ -253,6 +253,16 @@ export async function searchCatalog(
   // why: a fan-out where one source errors but another still finds
   // real products is a genuine success, not a failure to flag.
   let anyProviderErrored = false
+  // Mission F audit (Oct 2026) — true the moment ANY queried provider
+  // selected its results structurally (classify.ts's device-naming
+  // heuristic) rather than by text-matching the query — see
+  // data-source-provider.ts::searchByInferredDeviceCategory and
+  // CatalogSearchResult.matchedByInferredCategory's doc. Must be
+  // threaded through explicitly: this function reconstructs its return
+  // value field-by-field rather than spreading a single provider's
+  // result, so a new provider-level flag is silently lost unless
+  // tracked here too.
+  let anyMatchedByInferredCategory = false
 
   for (const { provider, fallbackPolicy } of providers) {
     let result: CatalogSearchResult = { products: [], total: null, hasMore: false }
@@ -278,6 +288,7 @@ export async function searchCatalog(
     collected.push(...result.products)
     total = total === null || result.total === null ? null : total + result.total
     if (result.hasMore) anyHasMore = true
+    if (result.matchedByInferredCategory) anyMatchedByInferredCategory = true
 
     // 'primary_only' never falls through to another source, found or
     // not. 'fallback_on_not_found' (the default) stops as soon as one
@@ -307,6 +318,7 @@ export async function searchCatalog(
     // fan-out that still found real products despite one source
     // erroring reports a normal, successful search.
     ...(anyProviderErrored && collected.length === 0 ? { hadError: true } : {}),
+    ...(anyMatchedByInferredCategory ? { matchedByInferredCategory: true } : {}),
   }
 }
 
