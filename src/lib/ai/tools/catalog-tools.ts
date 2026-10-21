@@ -66,10 +66,15 @@ export const CATALOG_TOOL_SPECS: ToolSpec[] = [
       'Cada producto incluye `is_likely_accessory_or_part` (heurística sobre el nombre real — NUNCA una categoría ' +
       'confirmada): `true` significa que el nombre coincide con un repuesto/accesorio conocido (pantalla, batería, ' +
       'flex, cable, funda, etc.); `false` NO significa que sea un teléfono/TV confirmado, solo que no coincidió con ' +
-      'esos términos. Cuando el cliente pida específicamente teléfonos/televisores (no repuestos ni accesorios), ' +
-      'usa esta señal para excluir de tu respuesta lo que claramente sea un repuesto/accesorio. `facets.' +
-      'productKindSplit` te dice cuántos de estos resultados parecen repuestos/accesorios frente a dispositivos — ' +
-      'si la mayoría son repuestos, dilo honestamente en vez de presentar la lista como si fueran todos teléfonos.',
+      'esos términos. También incluye `product_confidence` con tres valores posibles, ninguno es una certeza del ' +
+      'catálogo: "accessory_or_part" (repuesto/accesorio probable, igual que is_likely_accessory_or_part=true), ' +
+      '"likely_device" (hay evidencia real — marca/modelo del catálogo, o un nombre con el patrón real de un ' +
+      'teléfono en venta — de que es un dispositivo), "uncertain" (ninguna de las dos cosas — NO asumas que es un ' +
+      'teléfono solo porque el nombre menciona una marca o modelo conocido; dilo como incierto o pide confirmar). ' +
+      'Cuando el cliente pida específicamente teléfonos/televisores (no repuestos ni accesorios), usa estas ' +
+      'señales para excluir de tu respuesta lo que claramente sea un repuesto/accesorio. `facets.productKindSplit` ' +
+      'te dice cuántos de estos resultados parecen repuestos/accesorios frente a dispositivos — si la mayoría son ' +
+      'repuestos, dilo honestamente en vez de presentar la lista como si fueran todos teléfonos.',
     inputSchema: {
       type: 'object',
       properties: {

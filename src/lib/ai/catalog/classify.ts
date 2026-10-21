@@ -101,3 +101,34 @@ export function guessBrandFromName(name: string): string | null {
   // contain a digit.
   return /^[A-Z][A-Z-]{2,}$/.test(firstWord) ? firstWord : null
 }
+
+/** Real catalog naming pattern for a sellable phone in THIS catalog's
+ *  convention — "<model> <storage>GB + <ram>GB <color>" (confirmed
+ *  against real rows: "MOTOROLA G06 64GB + 4GB NARANJA", "SAMSUNG A56
+ *  5G 256GB + 12GB NEGRO"). Catalogs with a different real naming
+ *  convention simply won't match this — they fall back to `uncertain`
+ *  below rather than a false negative being treated as "not a device". */
+const DEVICE_NAME_PATTERN = /\d+GB\s*\+\s*\d+GB/i
+
+/**
+ * Commercial-veracity audit (Oct 2026), ternary product confidence —
+ * never a binary "is a smartphone" claim from name-matching alone
+ * (the real incident this closes: a product was treated as confirmed
+ * stock because its name contained "Samsung"/"A16"). Prefers real
+ * structured fields when the catalog actually has them; falls back to
+ * the name-text heuristics above ONLY when those are absent, and even
+ * then only ever returns 'likely_device' when there's REAL positive
+ * evidence (a recognized naming pattern) — never merely "didn't match
+ * a part keyword", which stays 'uncertain' instead.
+ */
+export type ProductConfidence = 'accessory_or_part' | 'uncertain' | 'likely_device'
+
+export function classifyProductConfidence(product: { name: string; brand?: string | null; model?: string | null }): ProductConfidence {
+  if (isLikelyAccessoryOrPart(product.name)) return 'accessory_or_part'
+  // Real structured data, when the catalog actually has it, is
+  // stronger evidence than any name heuristic — "usar campos
+  // estructurados cuando existan".
+  if ((product.brand && product.brand.trim()) || (product.model && product.model.trim())) return 'likely_device'
+  if (DEVICE_NAME_PATTERN.test(product.name)) return 'likely_device'
+  return 'uncertain'
+}

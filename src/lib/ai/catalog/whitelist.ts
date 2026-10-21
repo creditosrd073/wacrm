@@ -14,7 +14,7 @@
 // DataSourceCatalogProvider) call this before returning.
 // ============================================================
 
-import { isLikelyAccessoryOrPart } from './classify'
+import { classifyProductConfidence, isLikelyAccessoryOrPart, type ProductConfidence } from './classify'
 import type { CatalogImage, CatalogProduct } from './types'
 
 export interface RawCatalogProductInput {
@@ -133,8 +133,18 @@ export function toCatalogProduct(raw: RawCatalogProductInput): CatalogProduct {
  */
 export function toToolResultProduct(
   p: CatalogProduct,
-): Omit<CatalogProduct, 'source'> & { price_confirmed: boolean; is_likely_accessory_or_part: boolean } {
+): Omit<CatalogProduct, 'source'> & { price_confirmed: boolean; is_likely_accessory_or_part: boolean; product_confidence: ProductConfidence } {
   const { source, ...rest } = p
   void source
-  return { ...rest, price_confirmed: p.price !== null, is_likely_accessory_or_part: isLikelyAccessoryOrPart(p.name) }
+  return {
+    ...rest,
+    price_confirmed: p.price !== null,
+    is_likely_accessory_or_part: isLikelyAccessoryOrPart(p.name),
+    // Commercial-veracity audit (Oct 2026) — the explicit ternary this
+    // engagement's own mandate requires: never treat "didn't match a
+    // part keyword" as "confirmed device" (the real incident this
+    // closes). Prefers real brand/model fields when the catalog has
+    // them — see classify.ts::classifyProductConfidence.
+    product_confidence: classifyProductConfidence(p),
+  }
 }

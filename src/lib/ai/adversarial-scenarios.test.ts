@@ -407,8 +407,8 @@ describe('E — a conflicting admin system_prompt (RP-2.1-A / RP-2.1-B)', () => 
 // F — the provider fabricates a price that contradicts the real tool
 // result. Documents an architectural absence, not a vulnerability.
 // ------------------------------------------------------------
-describe('F — the pipeline has no second layer that validates a fabricated price against the real tool result', () => {
-  it('a scripted provider response that contradicts the real $7,500 tool result is passed through UNCHANGED — no code-level guardrail catches it', async () => {
+describe('F — generateReply/parseGeneration themselves never validate a fabricated price against the real tool result (the orchestration layer above them now does — see verify-claims.test.ts)', () => {
+  it('a scripted provider response that contradicts the real $7,500 tool result is passed through UNCHANGED by generateReply itself — no guardrail at THIS layer', async () => {
     const REAL_PRICE = 7500
     const db = fakeCatalogDb([catalogProductRow('p1', 'Samsung A07', { price: REAL_PRICE })])
     const FABRICATED_TEXT = 'El Samsung A07 cuesta 1,500 pesos.' // contradicts REAL_PRICE
@@ -469,13 +469,21 @@ describe('F — the pipeline has no second layer that validates a fabricated pri
     expect(result.text).toBe(FABRICATED_TEXT)
     expect(result.text).not.toContain(String(REAL_PRICE))
 
-    // This does NOT mean the pipeline is unprotected in practice — see
-    // the DEFAULT PROMPT TEXT (buildSystemPrompt's own "ABSOLUTELY
-    // NEVER invent prices..." guideline) — it means that protection is
-    // ENTIRELY a matter of the real model's own obedience to that
-    // prompt text, with no code-level backstop. No guardrail is
-    // proposed or implemented here; this is a documentation test, not
-    // a fix.
+    // Real-incident fix (Oct 2026, catalog/verify-claims.ts) — a
+    // code-level guardrail DOES exist now, but deliberately one layer
+    // up from here: `generateReply`/`parseGeneration` (what this test
+    // calls directly) still never reconciles text against tool
+    // results, by design — they don't have the catalog context this
+    // check also needs. auto-reply.ts's `processOneTurn` (and the
+    // Playground route) call `verifyCommercialClaims(text, toolCalls,
+    // previousCatalogContext)` right after this same `generateReply`
+    // call returns, and replace an unverified reply with an honest
+    // holding message before anything reaches a real customer — see
+    // verify-claims.test.ts for the fix's own regression tests,
+    // including this exact "states a price the real tool never
+    // returned" shape. This test's own assertions above remain
+    // accurate and intentionally unchanged: they document that THIS
+    // layer, in isolation, still has no guardrail of its own.
   })
 })
 
