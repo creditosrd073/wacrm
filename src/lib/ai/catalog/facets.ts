@@ -20,7 +20,7 @@
 // list of every value that could ever exist in the catalog.
 // ============================================================
 
-import { guessBrandFromName, isLikelyAccessoryOrPart } from './classify'
+import { guessBrandFromName, isLikelyAccessoryOrPart, isLikelyResidentialPhone } from './classify'
 import type { CatalogProduct } from './types'
 
 /** Cap on how many distinct values one facet reports — keeps the tool
@@ -81,10 +81,15 @@ export interface CatalogFacets {
    *  (catalog/classify.ts). Lets the agent tell the customer honestly
    *  that e.g. "most of what matched looks like repair parts, not
    *  phones" instead of presenting a parts-polluted list as a clean
-   *  device listing. `likelyDevice` is a NEGATIVE-signal count (did
-   *  NOT match a known part/accessory keyword) — never a positive
-   *  confirmation every one of those is actually a phone. */
-  productKindSplit?: { likelyAccessoryOrPart: number; likelyDevice: number }
+   *  device listing. `likelyResidentialPhone` (same audit, Mission D)
+   *  is its own bucket — a landline/residential phone is never a
+   *  smartphone, so it must never be silently absorbed into
+   *  `likelyDevice`'s count (the real incident this closes: a Samsung
+   *  residential phone being mistaken for, or used to imply, a Samsung
+   *  SMARTPHONE). `likelyDevice` is a NEGATIVE-signal count (matched
+   *  neither of the other two buckets) — never a positive confirmation
+   *  every one of those is actually a smartphone. */
+  productKindSplit?: { likelyAccessoryOrPart: number; likelyResidentialPhone: number; likelyDevice: number }
 }
 
 function distinctSorted(values: (string | null | undefined)[]): string[] | undefined {
@@ -145,7 +150,12 @@ export function computeFacets(products: CatalogProduct[]): CatalogFacets | undef
   facets.stock = { inStock, outOfStock: products.length - inStock }
 
   const likelyAccessoryOrPart = products.filter((p) => isLikelyAccessoryOrPart(p.name)).length
-  facets.productKindSplit = { likelyAccessoryOrPart, likelyDevice: products.length - likelyAccessoryOrPart }
+  const likelyResidentialPhone = products.filter((p) => isLikelyResidentialPhone(p.name)).length
+  facets.productKindSplit = {
+    likelyAccessoryOrPart,
+    likelyResidentialPhone,
+    likelyDevice: products.length - likelyAccessoryOrPart - likelyResidentialPhone,
+  }
 
   return facets
 }

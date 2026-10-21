@@ -1,6 +1,7 @@
 import type { SupabaseClient } from '@supabase/supabase-js'
 import { AiError, type AiProvider, type AiUsage, type ToolCallLogEntry } from './types'
 import type { RoutingDecision } from './routing'
+import type { CatalogSearchTraceEntry, SearchCompletionStatus } from './catalog/observability'
 
 /** Longest `error_message` this file will ever write — a defensive cap,
  *  not a redaction attempt. `AiError.message` (see providers/shared.ts
@@ -103,6 +104,27 @@ export interface LogAiUsageArgs {
    *  (see classifyGenerateFailure) — never a raw provider response
    *  body, never headers, never the API key, never the prompt. */
   errorMessage?: string
+  /** Mission D audit (Oct 2026), Fase 7 — one entry per search_catalog
+   *  call this turn (catalog/observability.ts::buildCatalogSearchTrace).
+   *  NULL (omitted) when no search_catalog call happened this turn. */
+  catalogSearchTrace?: CatalogSearchTraceEntry[]
+  /** The single worst status across `catalogSearchTrace` — see
+   *  buildCatalogSearchTrace's doc. NULL when no search_catalog call
+   *  happened this turn. */
+  searchCompletionStatus?: SearchCompletionStatus
+  /** MAX_TOOL_CALLS_PER_GENERATE at call time — recorded alongside
+   *  `toolCallCount` so budget exhaustion is computable even if the
+   *  constant changes later. */
+  toolCallBudgetMax?: number
+  /** Whether verifyCommercialClaims found every price/quantity claim
+   *  in the reply backed by real data this turn. Undefined (NULL) when
+   *  verification did not run (no catalog tools, no reply text, or a
+   *  handoff) — never coerced to true/false for "not applicable". */
+  commercialValidationPassed?: boolean
+  /** How many unsupported claims verifyCommercialClaims found (0 when
+   *  commercialValidationPassed is true). Undefined under the same
+   *  "did not run" condition as commercialValidationPassed. */
+  commercialValidationIssueCount?: number
 }
 
 /**
@@ -202,6 +224,13 @@ export async function logAiUsage(
       tool_turns_exhausted: args.toolTurnsExhausted ?? null,
       error_code: args.errorCode ?? null,
       error_message: args.errorMessage ?? null,
+      // Mission D audit (Oct 2026), Fase 7 — migration 063. Same NULL-
+      // when-not-computed discipline as every field above.
+      catalog_search_trace: args.catalogSearchTrace ?? null,
+      search_completion_status: args.searchCompletionStatus ?? null,
+      tool_call_budget_max: args.toolCallBudgetMax ?? null,
+      commercial_validation_passed: args.commercialValidationPassed ?? null,
+      commercial_validation_issue_count: args.commercialValidationIssueCount ?? null,
     })
     if (error) {
       console.error('[ai usage] log insert failed:', error)

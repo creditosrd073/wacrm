@@ -1468,7 +1468,15 @@ describe('dispatchInboundToAiReply — SEAM: real generateReply + real tool-call
           choices: [{ message: { content: null, tool_calls: [{ id: 'call_1', type: 'function', function: { name: 'search_catalog', arguments: '{"query":"Samsung A07"}' } }] } }],
         }),
       )
-      .mockResolvedValueOnce(okFetchResponse({ choices: [{ message: { content: FABRICATED_TEXT } }] }))
+      .mockResolvedValueOnce(
+        okFetchResponse({
+          choices: [{ message: { content: FABRICATED_TEXT } }],
+          // A real usage block (Fase 7 needs a written ai_usage_log row to
+          // assert against — normalizeUsage returns null, and logAiUsage
+          // skips the insert entirely, when every count is 0/absent).
+          usage: { prompt_tokens: 50, completion_tokens: 20, total_tokens: 70 },
+        }),
+      )
     vi.stubGlobal('fetch', fetchMock)
 
     await dispatchInboundToAiReply(ARGS)
@@ -1486,6 +1494,23 @@ describe('dispatchInboundToAiReply — SEAM: real generateReply + real tool-call
     // is enough, the conversation continues normally next message.
     expect(h.state.updatePayload).not.toHaveProperty('status')
     expect(h.state.updatePayload).not.toHaveProperty('ai_autoreply_disabled')
+
+    // Fase 7 (observability, Mission D audit) — the search itself
+    // genuinely succeeded (real product, real price found); what
+    // failed was the MODEL's own claim, not the data. The logged row
+    // must make that distinction diagnosable: search_completion_status
+    // reflects the real, successful search, while commercial_validation
+    // _passed is false — the signal that the generation, not the
+    // catalog, is where this turn actually went wrong.
+    expect(h.state.usageLogInserts).toHaveLength(1)
+    const row = h.state.usageLogInserts[0]
+    expect(row.search_completion_status).toBe('completa')
+    expect(row.commercial_validation_passed).toBe(false)
+    expect(row.commercial_validation_issue_count).toBeGreaterThan(0)
+    expect(row.tool_call_budget_max).toBe(6)
+    expect(row.catalog_search_trace).toEqual([
+      expect.objectContaining({ query: 'Samsung A07', status: 'completa', returned: 1, total: 1 }),
+    ])
   })
 
   it('the SAME real price (7500) stated correctly is NEVER flagged — the guardrail does not block a genuinely grounded answer', async () => {
@@ -1501,12 +1526,25 @@ describe('dispatchInboundToAiReply — SEAM: real generateReply + real tool-call
           choices: [{ message: { content: null, tool_calls: [{ id: 'call_1', type: 'function', function: { name: 'search_catalog', arguments: '{"query":"Samsung A07"}' } }] } }],
         }),
       )
-      .mockResolvedValueOnce(okFetchResponse({ choices: [{ message: { content: GROUNDED_TEXT } }] }))
+      .mockResolvedValueOnce(
+        okFetchResponse({
+          choices: [{ message: { content: GROUNDED_TEXT } }],
+          usage: { prompt_tokens: 50, completion_tokens: 20, total_tokens: 70 },
+        }),
+      )
     vi.stubGlobal('fetch', fetchMock)
 
     await dispatchInboundToAiReply(ARGS)
 
     expect(h.engineSendText).toHaveBeenCalledWith(expect.objectContaining({ text: GROUNDED_TEXT }))
+
+    // Fase 7 (observability) — a genuinely grounded reply logs
+    // commercial_validation_passed: true, never false just because a
+    // claim happened to need checking.
+    const row = h.state.usageLogInserts[0]
+    expect(row.commercial_validation_passed).toBe(true)
+    expect(row.commercial_validation_issue_count).toBe(0)
+    expect(row.search_completion_status).toBe('completa')
   })
 
   it('provider-failure scenario: fetch returns a real 500 → real generateReply throws a real AiError → the existing F2 handoff fires, same as the fully-mocked F2 tests', async () => {
