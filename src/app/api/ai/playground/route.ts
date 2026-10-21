@@ -15,6 +15,7 @@ import { createResolverCache, hasActiveCatalogSources } from '@/lib/ai/catalog/r
 import { CATALOG_TOOL_SPECS, executeCatalogTool } from '@/lib/ai/tools/catalog-tools'
 import { catalogContextToPromptText, updateCatalogContext, type CatalogTurnContext } from '@/lib/ai/catalog/context'
 import { verifyCommercialClaims } from '@/lib/ai/catalog/verify-claims'
+import { buildCatalogSearchTrace } from '@/lib/ai/catalog/observability'
 
 // Keep the tested transcript bounded, mirroring the live context window.
 const MAX_TURNS = 20
@@ -55,6 +56,14 @@ export async function POST(request: Request) {
   let usedKnowledgeForLog: boolean | undefined
   let preGenerateMsForLog: number | undefined
   let accountIdForLog: string | undefined
+  // Fase 7 (observability, Mission D audit) — same "one log line, no
+  // new table" discipline this route already uses above; see
+  // auto-reply.ts/usage.ts for the WhatsApp-side equivalent, which DOES
+  // persist to ai_usage_log (a real customer interaction worth
+  // aggregating over time) — this route stays console-only by the same
+  // deliberate choice already documented on the final log line below.
+  let searchCompletionStatusForLog: string | undefined
+  let commercialValidationPassedForLog: boolean | undefined
   try {
     const { supabase, accountId, userId } = await requireRole('agent')
     accountIdForLog = accountId
@@ -214,11 +223,15 @@ export async function POST(request: Request) {
     let commercialClaimIssues: string[] | undefined
     if (routing.useCatalog && text && !handoff) {
       const verification = verifyCommercialClaims(text, toolCalls, incomingCatalogContext)
+      commercialValidationPassedForLog = verification.verified
       if (!verification.verified) {
         commercialClaimIssues = verification.issues
         text = 'Necesito confirmar esa información con el inventario antes de dártela con certeza — dame un momento. 😊'
       }
     }
+    // Fase 7 (observability) — same derivation as auto-reply.ts, see
+    // catalog/observability.ts's module doc.
+    searchCompletionStatusForLog = buildCatalogSearchTrace(toolCalls).overallStatus ?? undefined
 
     // Same deterministic, server-side resolution auto-reply.ts uses —
     // runs only on the (rare) handoff path, and only against THIS
@@ -298,7 +311,9 @@ export async function POST(request: Request) {
       `[ai/playground] accountId=${accountIdForLog ?? 'unknown'} outcome=${outcome} ` +
         `totalMs=${Date.now() - requestStartedAt} preGenerateMs=${preGenerateMsForLog ?? 'n/a'} ` +
         `toolCalls=${toolCallCountForLog} usedCatalog=${usedCatalogForLog ?? 'n/a'} ` +
-        `usedKnowledge=${usedKnowledgeForLog ?? 'n/a'}`,
+        `usedKnowledge=${usedKnowledgeForLog ?? 'n/a'} ` +
+        `searchCompletionStatus=${searchCompletionStatusForLog ?? 'n/a'} ` +
+        `commercialValidationPassed=${commercialValidationPassedForLog ?? 'n/a'}`,
     )
   }
 }

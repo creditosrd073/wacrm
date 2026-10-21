@@ -51,6 +51,13 @@ describe('logAiUsage', () => {
       tool_turns_exhausted: null,
       error_code: null,
       error_message: null,
+      // Mission D audit (Oct 2026), Fase 7 — migration 063, same
+      // NULL-when-not-computed discipline.
+      catalog_search_trace: null,
+      search_completion_status: null,
+      tool_call_budget_max: null,
+      commercial_validation_passed: null,
+      commercial_validation_issue_count: null,
     })
   })
 
@@ -396,5 +403,47 @@ describe('logAiUsage — H8-2 failed-attempt rows', () => {
     const row = insert.mock.calls[0][0] as Record<string, unknown>
     expect(row.finish_reason).toBe('max_tokens')
     expect(row.tool_turns_exhausted).toBe(true)
+  })
+
+  it('writes the catalog search trace, completion status, budget max, and commercial validation outcome when the caller computes them (Mission D, Fase 7)', async () => {
+    const { db, insert } = fakeDb()
+    const trace = [{ query: 'a26', offset: 0, total: 1, status: 'completa' as const }]
+    await logAiUsage(db, {
+      accountId: 'acct-1',
+      conversationId: 'conv-1',
+      mode: 'auto_reply',
+      provider: 'anthropic',
+      model: 'claude-x',
+      usage: { promptTokens: 10, completionTokens: 5, totalTokens: 15 },
+      catalogSearchTrace: trace,
+      searchCompletionStatus: 'completa',
+      toolCallBudgetMax: 6,
+      commercialValidationPassed: true,
+      commercialValidationIssueCount: 0,
+    })
+    const row = insert.mock.calls[0][0] as Record<string, unknown>
+    expect(row.catalog_search_trace).toEqual(trace)
+    expect(row.search_completion_status).toBe('completa')
+    expect(row.tool_call_budget_max).toBe(6)
+    expect(row.commercial_validation_passed).toBe(true)
+    expect(row.commercial_validation_issue_count).toBe(0)
+  })
+
+  it('writes NULL (never false/0) for the Fase 7 fields when the caller never computed them', async () => {
+    const { db, insert } = fakeDb()
+    await logAiUsage(db, {
+      accountId: 'acct-1',
+      conversationId: 'conv-1',
+      mode: 'auto_reply',
+      provider: 'anthropic',
+      model: 'claude-x',
+      usage: { promptTokens: 10, completionTokens: 5, totalTokens: 15 },
+    })
+    const row = insert.mock.calls[0][0] as Record<string, unknown>
+    expect(row.catalog_search_trace).toBeNull()
+    expect(row.search_completion_status).toBeNull()
+    expect(row.tool_call_budget_max).toBeNull()
+    expect(row.commercial_validation_passed).toBeNull()
+    expect(row.commercial_validation_issue_count).toBeNull()
   })
 })
