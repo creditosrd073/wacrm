@@ -148,12 +148,13 @@ function fakeDb(): SupabaseClient {
             return Promise.resolve({ data: match ?? null, error: null })
           },
           // data-source-provider.ts's fallback-scan tier chains
-          // .order() before .limit() — missing it here used to throw a
-          // synchronous TypeError, which (correctly, since the AI agent
-          // audit fix) now surfaces as a real provider failure instead
-          // of silently looking like "found nothing".
+          // .order() before .range() (previously .limit() — see the
+          // broad-search reliability audit's pagination fix) — missing
+          // it here would throw a synchronous TypeError, which
+          // (correctly) surfaces as a real provider failure instead of
+          // silently looking like "found nothing".
           order: () => api,
-          limit: () => Promise.resolve({ data: PRODUCTS, error: null }),
+          range: (from: number, to: number) => Promise.resolve({ data: PRODUCTS.slice(from, to + 1), error: null }),
         }
         return api
       }
@@ -684,5 +685,49 @@ describe('Full pipeline — realistic mixed catalog (null brand, repair parts ou
       'MOTOROLA G06 64GB + 4GB NARANJA',
       'SAMSUNG A56 128GB + 6GB NEGRO',
     ])
+  })
+
+  it('a multi-model query ("A26 A36 A37 A56") surfaces every real device model that exists, and never fabricates one that doesn\'t', async () => {
+    const db = fakeDbWithProducts([
+      ...MIXED_CATALOG,
+      rowNullBrand('d4', 'SAMSUNG A36 128GB + 8GB BLANCO', { price: 18000 }),
+      rowNullBrand('d5', 'SAMSUNG A37 128GB + 6GB MORADO', { price: 19000 }),
+      rowNullBrand('p6', 'PANTALLA SAMSUNG A36 CON BEZEL', { price: 2800 }),
+      // Deliberately NO "A26" row at all — this catalog genuinely
+      // doesn't have one; the agent must never invent it.
+    ])
+    const executeTool = executeCatalogTool(db, 'acct-1')
+    const result = (await executeTool({ id: 'c1', name: 'search_catalog', input: { query: 'samsung A26 A36 A37 A56', limit: 20 } })) as {
+      products: { name: string; is_likely_accessory_or_part: boolean }[]
+    }
+    const deviceNames = result.products.filter((p) => !p.is_likely_accessory_or_part).map((p) => p.name)
+    expect(deviceNames).toContain('SAMSUNG A56 128GB + 6GB NEGRO')
+    expect(deviceNames).toContain('SAMSUNG A36 128GB + 8GB BLANCO')
+    expect(deviceNames).toContain('SAMSUNG A37 128GB + 6GB MORADO')
+    // No A26 anywhere in the real results — confirms the fixture (and
+    // the pipeline) never fabricates a model that isn't really there.
+    expect(result.products.some((p) => p.name.includes('A26'))).toBe(false)
+  })
+
+  it('a brand query with ZERO real devices (only repair parts) is distinguishable from a genuine search failure — productKindSplit shows likelyDevice: 0, never a false "not found" or an invented device', async () => {
+    // Models the real, confirmed "iphone" case: 0 of 0 iPhone-named
+    // rows in the live catalog match the real device pattern — every
+    // single one is a repair part/accessory.
+    const db = fakeDbWithProducts([
+      rowNullBrand('ip1', 'BATERIA IPHONE 13', { price: 800 }),
+      rowNullBrand('ip2', 'PANTALLA IPHONE 13 PRO', { price: 3000 }),
+      rowNullBrand('ip3', 'CABLE IPHONE ORIGINAL TIPO C A LIGHTNING', { price: 400 }),
+    ])
+    const executeTool = executeCatalogTool(db, 'acct-1')
+    const result = (await executeTool({ id: 'c1', name: 'search_catalog', input: { query: 'iphone', limit: 20 } })) as {
+      products: unknown[]
+      total: number
+      facets?: { productKindSplit?: { likelyAccessoryOrPart: number; likelyDevice: number } }
+    }
+    // NOT a confirmed-empty result (there ARE 3 real matches) — a model
+    // reading this must say "solo tenemos repuestos, no el teléfono",
+    // never "no tenemos nada" and never invent an iPhone to sell.
+    expect(result.total).toBe(3)
+    expect(result.facets?.productKindSplit).toEqual({ likelyAccessoryOrPart: 3, likelyDevice: 0 })
   })
 })
