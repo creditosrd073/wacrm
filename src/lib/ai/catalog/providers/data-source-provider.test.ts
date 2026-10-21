@@ -39,7 +39,17 @@ function fakeDb(opts: {
           return api
         },
         order: () => api,
-        limit: () => Promise.resolve(opts.scanError ? { data: null, error: opts.scanError } : { data: opts.scanRows ?? [], error: null }),
+        // Broad-search reliability audit (Oct 2026) — the fallback tier
+        // now paginates via .range() instead of a single .limit() call
+        // (see data-source-provider.ts's FALLBACK_SCAN_PAGE_SIZE doc).
+        // Faithfully slices `scanRows` so a fixture larger than one page
+        // (see the dedicated pagination test below) is actually
+        // exercised across multiple simulated round trips, not just
+        // returned whole on the first call.
+        range: (from: number, to: number) =>
+          Promise.resolve(
+            opts.scanError ? { data: null, error: opts.scanError } : { data: (opts.scanRows ?? []).slice(from, to + 1), error: null },
+          ),
         maybeSingle: () => {
           if (opts.scanError) return Promise.resolve({ data: null, error: opts.scanError })
           const sourceProductId = filters.find(([c]) => c === 'source_product_id')?.[1]
@@ -315,5 +325,100 @@ describe('DataSourceCatalogProvider — Bug #4 fix: two originally-duplicate-SKU
     expect(availA?.availableQuantity).toBe(3)
     expect(availB?.available).toBe(false)
     expect(availB?.availableQuantity).toBe(0)
+  })
+})
+
+// ============================================================
+// Broad-search reliability audit (Oct 2026) — real, demonstrated
+// incident: against the live "Consultas KC" catalog (1,143 rows), a
+// plain "televisor" query (0 hits at the DB/FTS tier, since no product
+// name literally contains that word) fell to this fallback tier and
+// could never find the one real KOOLHOME TV — confirmed directly: its
+// row sits at `id`-ascending position 1054, past the OLD fixed
+// `FALLBACK_SCAN_LIMIT=500` cutoff. Fixed by paginating through the
+// WHOLE data source instead of one capped call. Fixture here is
+// synthetic/deterministic (never real inventory, per this audit's own
+// "no depender del inventario cambiante de producción" rule) but
+// reproduces the exact mechanism: 1,200 rows (over both the old 500
+// cutoff AND the 1,000-row PostgREST page size), with the one matching
+// row placed at position 1054 — the real KOOLHOME row's own position.
+// ============================================================
+describe('DataSourceCatalogProvider — fallback tier scans the WHOLE data source, not just a fixed first slice', () => {
+  it('finds a row placed at position 1054 of 1200 — past the OLD 500-row cutoff AND past one 1000-row page', async () => {
+    const filler = Array.from({ length: 1200 }, (_, i) =>
+      row({ id: `row-${String(i).padStart(4, '0')}`, source_product_id: `row-${i}`, name: `PRODUCTO DE RELLENO ${i}` }),
+    )
+    filler[1054] = row({ id: 'row-1054', source_product_id: 'row-1054', name: 'TV SMART TV KOOLHOME GOOGLE TV 32" FHD' })
+    const { db } = fakeDb({ scanRows: filler })
+    const provider = new DataSourceCatalogProvider(db, 'acct-1', 'ds-1', 'PRUEBA')
+
+    const result = await provider.searchCatalog({ query: 'televisor', limit: 20 })
+    const names = result.products.map((p) => p.name)
+    expect(names.some((n) => n.includes('KOOLHOME'))).toBe(true)
+  })
+
+  it('still works correctly for a fixture that fits within a single 1000-row page (regression guard — the common case)', async () => {
+    const { db } = fakeDb({ scanRows: [row({ name: 'TV TCL GOOGLE TV 50 4K' })] })
+    const provider = new DataSourceCatalogProvider(db, 'acct-1', 'ds-1', 'PRUEBA')
+    const result = await provider.searchCatalog({ query: 'televisor' })
+    expect(result.products).toHaveLength(1)
+  })
+})
+
+// ============================================================
+// Broad-search reliability audit (Oct 2026), Phase 3.7 — paginating
+// through the whole data source (above) trades the old fixed 500-row
+// blind spot for unbounded latency if Supabase is slow/degraded across
+// several pages. This proves the time-budget cutoff actually engages
+// and reports the result as honestly partial, never as complete.
+// ============================================================
+describe('DataSourceCatalogProvider — fallback scan time budget: a slow multi-page scan is cut short honestly, never silently presented as complete', () => {
+  it('stops paginating once the time budget is exceeded, and reports hasMore: true / total: null instead of a false "complete" result', async () => {
+    vi.useFakeTimers()
+    try {
+      // Each simulated page "takes" 5s of wall-clock time — the second
+      // page alone pushes elapsed time past the 8s budget, so a THIRD
+      // page must never be fetched.
+      let rangeCalls = 0
+      const db = {
+        // The DB/FTS tier is tried first — empty, non-error, so
+        // searchCatalog falls through to fallbackSearch exactly as the
+        // real "0 literal hits" case does.
+        rpc: async () => ({ data: [], error: null }),
+        from: (table: string) => {
+          if (table !== 'ai_catalog_products') throw new Error(`unexpected table ${table}`)
+          const api = {
+            select: () => api,
+            eq: () => api,
+            order: () => api,
+            range: async (from: number, to: number) => {
+              rangeCalls++
+              vi.advanceTimersByTime(5_000)
+              // Always a FULL page (1000 rows) — an endlessly "more
+              // data available" data source, so the loop would keep
+              // going forever if the time budget didn't cut it off.
+              const page = Array.from({ length: 1000 }, (_, i) =>
+                row({ id: `row-${from + i}`, source_product_id: `row-${from + i}`, name: `PRODUCTO ${from + i}` }),
+              )
+              void to
+              return { data: page, error: null }
+            },
+          }
+          return api
+        },
+      } as unknown as SupabaseClient
+      const provider = new DataSourceCatalogProvider(db, 'acct-1', 'ds-1', 'PRUEBA')
+
+      const result = await provider.searchCatalog({ query: 'nonexistent-term-forces-fallback' })
+
+      // Cut off after exactly 2 pages (0ms, then 5s, then the 3rd
+      // iteration's pre-check sees 10s > 8s budget and stops BEFORE a
+      // 3rd network call).
+      expect(rangeCalls).toBe(2)
+      expect(result.hasMore).toBe(true) // never silently "complete"
+      expect(result.total).toBeNull() // honestly unknown, not a false count of only what was scanned
+    } finally {
+      vi.useRealTimers()
+    }
   })
 })

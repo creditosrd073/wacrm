@@ -503,7 +503,7 @@ function parseQuantity(raw: string): number | null {
  * optimizes for. A future source that legitimately needs 3 decimal
  * places would need a different rule.
  */
-function parseLocaleNumber(raw: string): number | null {
+export function parseLocaleNumber(raw: string): number | null {
   const lastComma = raw.lastIndexOf(',')
   const lastDot = raw.lastIndexOf('.')
 

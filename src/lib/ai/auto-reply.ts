@@ -16,6 +16,7 @@ import { checkRateLimit, RATE_LIMITS } from '@/lib/rate-limit'
 import { createResolverCache, hasActiveCatalogSources } from './catalog/resolver'
 import { CATALOG_TOOL_SPECS, GET_PRODUCT_MEDIA, executeCatalogTool } from './tools/catalog-tools'
 import { catalogContextToPromptText, updateCatalogContext, type CatalogTurnContext } from './catalog/context'
+import { verifyCommercialClaims } from './catalog/verify-claims'
 import type { AiConfig, ToolExecutor } from './types'
 import type { SupabaseClient } from '@supabase/supabase-js'
 
@@ -546,8 +547,33 @@ async function processOneTurn(ctx: {
     }
     return { continueDraining: false }
   }
-  const { text, handoff, usage, toolCalls, finishReason, toolTurnsExhausted } = generated
+  const { text: rawText, handoff, usage, toolCalls, finishReason, toolTurnsExhausted } = generated
   const latencyMs = Date.now() - generateStartedAt
+
+  // Commercial-claims verification (real incident, Oct 2026): a model
+  // can report success (non-empty text, no [[HANDOFF]]) while stating a
+  // price/quantity that doesn't correspond to anything this turn's
+  // tools (or the carried catalog context) actually returned —
+  // adversarial-scenarios.test.ts already proved there was no second
+  // layer catching this, only a prompt instruction not to do it. Only
+  // checked when catalog tools were even available this turn (nothing
+  // to verify a knowledge-base-only answer against) and there's real
+  // text to check (an already-empty/handoff turn has nothing to say).
+  // Never rewrites a SPECIFIC wrong number out of otherwise-good prose
+  // (too error-prone to do reliably) — an unverified claim replaces the
+  // WHOLE reply with an honest holding message instead, same discipline
+  // as the exhaustion-recovery fallback: never fabricate, never send an
+  // ungrounded number to a real customer. Deliberately does NOT force a
+  // handoff by itself — "informar de la limitación" is enough; the
+  // conversation continues normally on the customer's next message.
+  let text = rawText
+  if (routing.useCatalog && text && !handoff) {
+    const verification = verifyCommercialClaims(text, toolCalls, previousCatalogContext)
+    if (!verification.verified) {
+      console.warn('[ai auto-reply] unverified commercial claim(s) — replacing reply with an honest holding message:', verification.issues)
+      text = 'Necesito confirmar esa información con el inventario antes de dártela con certeza — dame un momento. 😊'
+    }
+  }
 
   // Fold this turn's tool results into the cross-turn catalog context
   // (AI_Catalog_Fix_Kit FASE 5/6/9) so a later short follow-up like

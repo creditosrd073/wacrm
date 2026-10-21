@@ -14,6 +14,7 @@
 // DataSourceCatalogProvider) call this before returning.
 // ============================================================
 
+import { classifyProductConfidence, isLikelyAccessoryOrPart, type ProductConfidence } from './classify'
 import type { CatalogImage, CatalogProduct } from './types'
 
 export interface RawCatalogProductInput {
@@ -116,10 +117,34 @@ export function toCatalogProduct(raw: RawCatalogProductInput): CatalogProduct {
  * model turns the JSON into prose. `price` itself is left untouched —
  * callers that need the raw nullable number (facets, availability,
  * tests) are unaffected. */
+/**
+ * Broad-search reliability audit (Oct 2026) — `is_likely_accessory_or_part`
+ * is a heuristic computed ONLY from the real `name` text (see
+ * catalog/classify.ts for why it was added: a direct read of the real
+ * production catalog found no category field at all, and roughly half
+ * its rows are repair parts rather than sellable devices, with nothing
+ * previously distinguishing them to the model). `true` means the name
+ * matched a known part/accessory keyword; `false` means it did NOT —
+ * never a positive claim that the product IS a device, since there is
+ * no real category field to assert that from. Named with the
+ * `is_likely_...` prefix in the tool result itself (not just in this
+ * module) so the model never mistakes it for confirmed catalog data,
+ * the same discipline as `price_confirmed`.
+ */
 export function toToolResultProduct(
   p: CatalogProduct,
-): Omit<CatalogProduct, 'source'> & { price_confirmed: boolean } {
+): Omit<CatalogProduct, 'source'> & { price_confirmed: boolean; is_likely_accessory_or_part: boolean; product_confidence: ProductConfidence } {
   const { source, ...rest } = p
   void source
-  return { ...rest, price_confirmed: p.price !== null }
+  return {
+    ...rest,
+    price_confirmed: p.price !== null,
+    is_likely_accessory_or_part: isLikelyAccessoryOrPart(p.name),
+    // Commercial-veracity audit (Oct 2026) — the explicit ternary this
+    // engagement's own mandate requires: never treat "didn't match a
+    // part keyword" as "confirmed device" (the real incident this
+    // closes). Prefers real brand/model fields when the catalog has
+    // them — see classify.ts::classifyProductConfidence.
+    product_confidence: classifyProductConfidence(p),
+  }
 }

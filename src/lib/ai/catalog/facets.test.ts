@@ -51,12 +51,18 @@ describe('computeFacets — a single value per dimension', () => {
       sizes: ['50"'],
       priceRange: { min: 25000, max: 25000 },
       stock: { inStock: 1, outOfStock: 0 },
+      // Broad-search reliability audit (Oct 2026) — always computed
+      // when there's at least one product, same as `stock` above.
+      productKindSplit: { likelyAccessoryOrPart: 0, likelyDevice: 1 },
     })
     // No categories key — CatalogProduct has no such field anywhere;
     // inventing one would violate the "no fabricar datos" rule.
     expect(facets).not.toHaveProperty('categories')
     // No capacities key either — none of the fixture products set it.
     expect(facets).not.toHaveProperty('capacities')
+    // brandGuesses never coexists with brands — real brand data is
+    // present here, so no fallback guess is computed.
+    expect(facets).not.toHaveProperty('brandGuesses')
   })
 })
 
@@ -149,5 +155,52 @@ describe('computeFacets — never invents values (7)', () => {
     const products = Array.from({ length: 60 }, (_, i) => product({ brand: `Marca${i}` }))
     const facets = computeFacets(products)
     expect(facets?.brands).toHaveLength(50)
+  })
+})
+
+// ============================================================
+// Broad-search reliability audit (Oct 2026) — `brandGuesses` and
+// `productKindSplit`. Fixture names below are taken verbatim from the
+// real production catalog (see classify.test.ts's identical note).
+// ============================================================
+describe('computeFacets — brandGuesses: a heuristic fallback ONLY when brand is null everywhere', () => {
+  it('falls back to a name-derived brand guess when every product has brand: null', () => {
+    const facets = computeFacets([
+      product({ brand: null, name: 'MOTOROLA G06 64GB + 4GB NARANJA' }),
+      product({ brand: null, name: 'PANTALLA SAMSUNG A07' }),
+    ])
+    expect(facets?.brandGuesses).toEqual(['MOTOROLA', 'SAMSUNG'])
+    expect(facets).not.toHaveProperty('brands')
+  })
+
+  it('never computes brandGuesses when at least one product has a real brand — real data always wins, never diluted with a guess', () => {
+    const facets = computeFacets([
+      product({ brand: 'Samsung', name: 'TV Samsung 50"' }),
+      product({ brand: null, name: 'MOTOROLA G06 64GB + 4GB NARANJA' }),
+    ])
+    expect(facets?.brands).toEqual(['Samsung'])
+    expect(facets).not.toHaveProperty('brandGuesses')
+  })
+
+  it('omits brandGuesses (never an empty array) when no name yields a plausible guess either', () => {
+    const facets = computeFacets([product({ brand: null, name: 'BATERIA' })])
+    expect(facets).not.toHaveProperty('brandGuesses')
+  })
+})
+
+describe('computeFacets — productKindSplit: honest device-vs-accessory/part counts from real names', () => {
+  it('counts real repair-part names separately from real device names, from a mixed result', () => {
+    const facets = computeFacets([
+      product({ name: 'MOTOROLA G06 64GB + 4GB NARANJA' }), // device
+      product({ name: 'PANTALLA SAMSUNG A07' }), // part
+      product({ name: 'BATERIA SAMSUNG A05 A055M' }), // part
+      product({ name: 'HONOR PLAY 10 64GB + 3GB ELA-LX3 AZUL' }), // device
+    ])
+    expect(facets?.productKindSplit).toEqual({ likelyAccessoryOrPart: 2, likelyDevice: 2 })
+  })
+
+  it('is always present whenever there is at least one product — same discipline as `stock`', () => {
+    const facets = computeFacets([product()])
+    expect(facets?.productKindSplit).toBeDefined()
   })
 })

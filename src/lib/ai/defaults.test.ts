@@ -117,6 +117,40 @@ describe('buildSystemPrompt — Phase 5: strict Spanish, "unidades disponibles",
     const prompt = buildSystemPrompt(base)
     expect(prompt.toLowerCase()).toContain('moderate emoji')
   })
+
+  it('distinguishes singular "unidad disponible" from plural "unidades disponibles"', () => {
+    const prompt = buildSystemPrompt(base)
+    expect(prompt).toContain('unidad disponible')
+    expect(prompt).toContain('unidades disponibles')
+  })
+})
+
+// ============================================================
+// Broad-search reliability audit (Oct 2026), Phase 4/5 — empty vs.
+// partial vs. error must be three distinct situations, and a single
+// recoverable search error must never by itself force [[HANDOFF]].
+// ============================================================
+describe('buildSystemPrompt — Phase 4: empty vs. partial vs. error are distinct, and a recoverable error never auto-handoffs', () => {
+  const base = { userPrompt: null, mode: 'auto_reply' as const }
+
+  it('explicitly tells the model EMPTY/PARTIAL/ERROR are three different situations, only when catalog tools are attached', () => {
+    const withCatalog = buildSystemPrompt({ ...base, catalogToolsAvailable: true })
+    expect(withCatalog).toContain('EMPTY vs PARTIAL vs ERROR')
+    expect(withCatalog).toMatch(/RECOVERABLE technical hiccup, not a confirmed/)
+
+    const withoutCatalog = buildSystemPrompt({ ...base, catalogToolsAvailable: false })
+    expect(withoutCatalog).not.toContain('EMPTY vs PARTIAL vs ERROR')
+  })
+
+  it('explicitly says a single recoverable search error must never by itself trigger [[HANDOFF]]', () => {
+    const prompt = buildSystemPrompt({ ...base, catalogToolsAvailable: true })
+    expect(prompt).toMatch(/a single recoverable search error must NEVER by itself trigger \[\[HANDOFF\]\]/)
+  })
+
+  it('never treats a tool error as proof a product does not exist', () => {
+    const prompt = buildSystemPrompt({ ...base, catalogToolsAvailable: true })
+    expect(prompt).toMatch(/never treat a tool error as proof the product doesn't exist/)
+  })
 })
 
 // ============================================================

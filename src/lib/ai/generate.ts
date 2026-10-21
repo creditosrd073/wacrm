@@ -64,6 +64,7 @@ export async function generateReply(args: GenerateArgs): Promise<GenerateResult>
     toolCalls?: GenerateResult['toolCalls']
     finishReason?: string
     toolTurnsExhausted?: boolean
+    partialResultsUsed?: boolean
   }
   switch (config.provider) {
     case 'openai':
@@ -82,7 +83,14 @@ export async function generateReply(args: GenerateArgs): Promise<GenerateResult>
       })
   }
 
-  return parseGeneration(result.text, result.usage, result.toolCalls, result.finishReason, result.toolTurnsExhausted)
+  return parseGeneration(
+    result.text,
+    result.usage,
+    result.toolCalls,
+    result.finishReason,
+    result.toolTurnsExhausted,
+    result.partialResultsUsed,
+  )
 }
 
 /**
@@ -93,17 +101,20 @@ export async function generateReply(args: GenerateArgs): Promise<GenerateResult>
  * provider didn't report it).
  *
  * Playground/WhatsApp reliability audit (Oct 2026) — `toolTurnsExhausted`
- * ALSO forces `handoff: true`, regardless of mode. Previously this flag
- * was purely diagnostic (logged, never acted on): a model cut off mid
- * tool-investigation fell through to a canned "Un momento, permíteme
- * confirmar esa información." string reported as an ordinary successful
- * reply — auto-reply.ts's `if (handoff || !text)` never fired because
- * `text` was non-empty, so the customer got a promise of a follow-up
- * that nothing ever sent, and no human was ever notified. Exhausting the
- * tool budget/turn cap means the investigation is, by definition,
- * incomplete — that is never a resolved query, so it is routed through
- * the SAME existing handoff path a model-requested [[HANDOFF]] already
- * uses, rather than inventing a second mechanism.
+ * ALSO forces `handoff: true`, regardless of mode — UNLESS
+ * `partialResultsUsed` is also true (broad-search reliability audit,
+ * Oct 2026 follow-up): the provider adapter already attempted one
+ * bounded, tool-less synthesis call and got a genuine answer from the
+ * partial results it had gathered, so `text` here is that real,
+ * honestly-caveated answer, not the canned "Un momento, permíteme
+ * confirmar esa información." string — there's no longer anything to
+ * hand off FOR. Exhaustion with NO usable partial answer (the original
+ * bug: a model cut off mid tool-investigation whose canned fallback
+ * text was reported as an ordinary successful reply, with auto-reply.
+ * ts's `if (handoff || !text)` never firing because `text` was
+ * non-empty) still routes through the SAME existing handoff path a
+ * model-requested [[HANDOFF]] already uses, rather than inventing a
+ * second mechanism.
  */
 export function parseGeneration(
   raw: string,
@@ -111,8 +122,9 @@ export function parseGeneration(
   toolCalls: GenerateResult['toolCalls'] = [],
   finishReason?: string,
   toolTurnsExhausted?: boolean,
+  partialResultsUsed?: boolean,
 ): GenerateResult {
-  const handoff = raw.includes(HANDOFF_SENTINEL) || toolTurnsExhausted === true
+  const handoff = raw.includes(HANDOFF_SENTINEL) || (toolTurnsExhausted === true && !partialResultsUsed)
   const text = raw.split(HANDOFF_SENTINEL).join('').trim()
-  return { text, handoff, usage, toolCalls, finishReason, toolTurnsExhausted }
+  return { text, handoff, usage, toolCalls, finishReason, toolTurnsExhausted, partialResultsUsed }
 }

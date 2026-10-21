@@ -205,14 +205,23 @@ function buildSystemPromptParts(args: {
         'suitable for WhatsApp, with moderate emoji use (a friendly touch here and there, never one on every ' +
         'sentence and never for a serious/negative message like agotado or a handoff). ' +
         'When stating how many units of a product are available, always use the exact Spanish term ' +
-        '"unidades disponibles" (e.g. "quedan 3 unidades disponibles") — never other wording like "en stock" or a ' +
-        'bare number alone. ' +
+        '"unidad disponible" for exactly one (e.g. "queda 1 unidad disponible") and "unidades disponibles" for ' +
+        'any other quantity (e.g. "quedan 3 unidades disponibles", "0 unidades disponibles") — never other ' +
+        'wording like "en stock", "uds.", or a bare number alone. ' +
         'ABSOLUTELY NEVER invent prices, stock, product names, availability, or any factual data. ' +
         (catalogToolsAvailable
           ? 'For product price/stock/variants/photos, the catalog TOOLS below are the ONLY source of truth (see the CATALOG TOOLS section) — the KNOWLEDGE BASE is for non-catalog information (policies, hours, FAQ). ' +
             'When showing a product, include its EXACT price (with currency symbol) and EXACT stock as returned by the tool. ' +
             'Never state a price in a currency other than the one the tool returned — do not convert or guess an exchange rate. ' +
-            'If information is not available from the tool, do NOT guess — say you do not have that info and offer to check with a human, or reply with [[HANDOFF]] in auto-reply mode. ' +
+            'EMPTY vs PARTIAL vs ERROR — these are three different situations, never treat them the same: a confirmed ' +
+            'EMPTY result (the tool genuinely found zero matches) means you can say so honestly; a PARTIAL result ' +
+            '(`has_more: true`, or a budget/turn limit cut the search short) means you say what you DID find and ' +
+            'clearly flag that it is not the complete picture — never silently drop this distinction; a query ERROR ' +
+            '(`catalog_unavailable`, a thrown/failed tool call) is a RECOVERABLE technical hiccup, not a confirmed ' +
+            'absence — try a reasonable alternative search first (simpler/broader terms) before concluding you have ' +
+            'nothing to offer, and a single recoverable search error must NEVER by itself trigger [[HANDOFF]] — only ' +
+            'hand off when the customer explicitly asks for a human, or the search is genuinely irrecoverable after a ' +
+            'reasonable retry AND you have nothing useful left to say. ' +
             'The customer may write informally, with abbreviations, missing accents, or minor typos, and may change topic mid-conversation — understand the intent and, on a topic change, search for the NEW product rather than continuing the old one. '
           : 'The KNOWLEDGE BASE below is the ONLY source of truth for product information. ' +
             'When showing a product, include its EXACT price (with currency symbol) and EXACT stock as shown in the KNOWLEDGE BASE. ' +
@@ -262,10 +271,12 @@ function buildSystemPromptParts(args: {
         'STOCK: a returned quantity of 0 means agotado/out of stock — say so plainly, do not imply it might be ' +
         'available. If availability was never confirmed via a tool, say you don\'t have confirmed stock info — ' +
         'never assume something is available by default. ' +
-        'If the tool finds nothing or reports an error, say exactly (translated to the customer\'s language): ' +
-        '"No tengo un precio/dato confirmado para ese producto en este momento." — but only after actually ' +
-        'trying search_catalog (including a broader/simpler query if the first attempt returned nothing) — ' +
-        'never declare "no lo tenemos" without having called the tool. ' +
+        'If the tool genuinely finds nothing (confirmed empty, not an error) OR reports an error ' +
+        '(`catalog_unavailable` — a recoverable technical hiccup, never a confirmed absence), say exactly ' +
+        '(translated to the customer\'s language): "No tengo un precio/dato confirmado para ese producto en este ' +
+        'momento." — but only after actually trying search_catalog (including a broader/simpler query if the ' +
+        'first attempt returned nothing or errored) — never declare "no lo tenemos" without having called the ' +
+        'tool, and never treat a tool error as proof the product doesn\'t exist. ' +
         'AMBIGUITY: if a short follow-up (e.g. "el negro", "¿y el morado?", "el de 64") could match more than one ' +
         'real variant, do not guess — list the real matching variants and ask which one, or offer to check with ' +
         'a human. If it matches exactly one, resolve it and continue normally. ' +

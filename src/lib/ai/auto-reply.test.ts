@@ -1446,6 +1446,69 @@ describe('dispatchInboundToAiReply — SEAM: real generateReply + real tool-call
     expect(toolMessage?.content).toContain('7500')
   })
 
+  // ============================================================
+  // Real incident fix (Oct 2026, catalog/verify-claims.ts) — the exact
+  // shape adversarial-scenarios.test.ts's Test F proves generateReply
+  // itself never catches (a scripted final answer contradicting the
+  // real $7,500 tool result), now run through the FULL real pipeline
+  // (real executeCatalogTool/resolver, not mocked) to prove the
+  // orchestration layer one level up DOES catch it before anything
+  // reaches a real customer.
+  // ============================================================
+  it('a fabricated price that contradicts the REAL $7,500 tool result is NEVER sent to the customer — replaced with an honest holding message, no handoff forced', async () => {
+    h.state.dataSources = SEAM_ACTIVE_DATA_SOURCE
+    h.state.catalogProductRows = [seamProductRow()] // real price: 7500
+    h.buildConversationContext.mockResolvedValue([{ role: 'user', content: 'cuanto cuesta el samsung a07' }])
+
+    const FABRICATED_TEXT = 'El Samsung A07 64GB Negro cuesta RD$1,500 y tenemos 99 unidades disponibles.'
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(
+        okFetchResponse({
+          choices: [{ message: { content: null, tool_calls: [{ id: 'call_1', type: 'function', function: { name: 'search_catalog', arguments: '{"query":"Samsung A07"}' } }] } }],
+        }),
+      )
+      .mockResolvedValueOnce(okFetchResponse({ choices: [{ message: { content: FABRICATED_TEXT } }] }))
+    vi.stubGlobal('fetch', fetchMock)
+
+    await dispatchInboundToAiReply(ARGS)
+
+    // The fabricated numbers (1,500 / 99) never reach the customer —
+    // not the real price (7500) either, since neither is what was
+    // actually sent: a safe holding message replaces the whole reply.
+    expect(h.engineSendText).toHaveBeenCalledTimes(1)
+    const sentText = (h.engineSendText.mock.calls[0][0] as { text: string }).text
+    expect(sentText).not.toBe(FABRICATED_TEXT)
+    expect(sentText).not.toContain('1,500')
+    expect(sentText).not.toContain('99')
+
+    // This is NOT treated as a handoff — "informar de la limitación"
+    // is enough, the conversation continues normally next message.
+    expect(h.state.updatePayload).not.toHaveProperty('status')
+    expect(h.state.updatePayload).not.toHaveProperty('ai_autoreply_disabled')
+  })
+
+  it('the SAME real price (7500) stated correctly is NEVER flagged — the guardrail does not block a genuinely grounded answer', async () => {
+    h.state.dataSources = SEAM_ACTIVE_DATA_SOURCE
+    h.state.catalogProductRows = [seamProductRow()]
+    h.buildConversationContext.mockResolvedValue([{ role: 'user', content: 'cuanto cuesta el samsung a07' }])
+
+    const GROUNDED_TEXT = 'El Samsung A07 64GB Negro cuesta RD$7,500 y tenemos 3 unidades disponibles.'
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(
+        okFetchResponse({
+          choices: [{ message: { content: null, tool_calls: [{ id: 'call_1', type: 'function', function: { name: 'search_catalog', arguments: '{"query":"Samsung A07"}' } }] } }],
+        }),
+      )
+      .mockResolvedValueOnce(okFetchResponse({ choices: [{ message: { content: GROUNDED_TEXT } }] }))
+    vi.stubGlobal('fetch', fetchMock)
+
+    await dispatchInboundToAiReply(ARGS)
+
+    expect(h.engineSendText).toHaveBeenCalledWith(expect.objectContaining({ text: GROUNDED_TEXT }))
+  })
+
   it('provider-failure scenario: fetch returns a real 500 → real generateReply throws a real AiError → the existing F2 handoff fires, same as the fully-mocked F2 tests', async () => {
     h.buildConversationContext.mockResolvedValue([{ role: 'user', content: 'Hola, necesito ayuda' }])
 

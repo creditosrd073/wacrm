@@ -23,11 +23,46 @@ import type {
   CatalogSearchResult,
 } from '../types'
 
-/** Cap on how many of this data source's rows the in-memory fallback
- *  tier (normalize.ts) scans when the DB-side exact/FTS search finds
- *  nothing. Bounds cost for large catalogs — see the module doc in
- *  normalize.ts for why this tier is TypeScript-side rather than SQL. */
-const FALLBACK_SCAN_LIMIT = 500
+/** Page size the in-memory fallback tier (normalize.ts) paginates
+ *  through when the DB-side exact/FTS search finds nothing — see the
+ *  module doc in normalize.ts for why this tier is TypeScript-side
+ *  rather than SQL. 1000 matches PostgREST's own per-request row cap on
+ *  this project, so a catalog at or under that size needs only one
+ *  round trip.
+ *
+ *  Broad-search reliability audit (Oct 2026) — this tier used to be a
+ *  SINGLE capped `.limit(FALLBACK_SCAN_LIMIT)` call (500), which made
+ *  any row past that fixed cutoff structurally invisible to it,
+ *  independent of how well it would have ranked. Confirmed directly
+ *  against the real "Consultas KC" catalog (1,143 rows): the one
+ *  KOOLHOME TV sits at `id`-ascending position 1054 — a plain
+ *  "televisor" query (0 hits at the DB tier, since no product name
+ *  literally contains that word) fell to this tier and could never
+ *  find it, no matter the ranking, because the scan itself stopped at
+ *  500. Now paginates through the WHOLE data source instead of one
+ *  fixed-size page — see the loop in `fallbackSearch` below. */
+const FALLBACK_SCAN_PAGE_SIZE = 1000
+/** Hard ceiling on total rows scanned across every page, purely as a
+ *  sanity backstop against a pathologically large data source — not a
+ *  tuning knob for any catalog size seen in production so far (the
+ *  real one is 1,143 rows; this is ~9x that). Should this ever start
+ *  truncating a real account's catalog, that itself is the signal this
+ *  tier needs a different design (e.g. a server-side trigram/fuzzy
+ *  index), not a larger constant here. */
+const FALLBACK_SCAN_MAX_ROWS = 10_000
+/** Wall-clock budget for the WHOLE paginated scan, not any one page —
+ *  broad-search reliability audit (Oct 2026), Phase 3.7: paginating
+ *  through the whole data source (above) trades the old fixed 500-row
+ *  blind spot for unbounded latency if Supabase itself is slow/
+ *  degraded, since this tier can now issue several round trips instead
+ *  of one. 8s leaves comfortable room under the provider call's own
+ *  ~30s timeout (defaults.ts::aiRequestTimeoutMs) for the rest of that
+ *  turn's work, while still covering a real multi-page scan (the real
+ *  1,143-row catalog needs only 2 pages). Hitting this cuts the scan
+ *  short HONESTLY — `hasMore` is forced `true` in that case (see
+ *  `fallbackSearch` below), never silently presented as the complete
+ *  catalog. */
+const FALLBACK_SCAN_TIME_BUDGET_MS = 8_000
 
 interface CatalogProductRow {
   id: string
@@ -153,29 +188,48 @@ export class DataSourceCatalogProvider implements CatalogProvider {
   private async fallbackSearch(args: CatalogSearchArgs): Promise<CatalogSearchResult> {
     const limit = args.limit ?? 10
     const offset = args.offset ?? 0
-    const { data, error } = await this.db
-      .from('ai_catalog_products')
-      .select('*')
-      .eq('account_id', this.accountId)
-      .eq('data_source_id', this.dataSourceId)
-      // Deterministic base order — without it Postgres doesn't
-      // guarantee the same row order across separate calls, and since
-      // rankBySignificantTokens' sort is stable (ties keep INPUT
-      // order), an undeterministic scan here would make pagination
-      // within this tier flaky: the same row could land on two
-      // different pages, or on neither, between the offset=0 and
-      // offset=N calls of one "dame todas las X" listing.
-      .order('id', { ascending: true })
-      .limit(FALLBACK_SCAN_LIMIT)
-    if (error || !data) {
+
+    // Broad-search reliability audit (Oct 2026) — paginates through the
+    // WHOLE data source (bounded only by FALLBACK_SCAN_MAX_ROWS as a
+    // sanity backstop, not by a fixed page that silently hid everything
+    // past it) rather than one capped `.limit()` call — see
+    // FALLBACK_SCAN_PAGE_SIZE's doc for the real incident this fixes.
+    // Deterministic base order (`id` ascending) preserved exactly as
+    // before — without it Postgres doesn't guarantee the same row order
+    // across separate calls, and since rankBySignificantTokens' sort is
+    // stable (ties keep INPUT order), an undeterministic scan would
+    // make pagination within this tier flaky across separate calls.
+    const allRows: CatalogProductRow[] = []
+    const scanStartedAt = Date.now()
+    // True only if the time budget cut the scan short WHILE more pages
+    // likely remained — never set just because the loop finished
+    // normally (page.length < FALLBACK_SCAN_PAGE_SIZE, or MAX_ROWS).
+    let scanIncomplete = false
+    for (let from = 0; from < FALLBACK_SCAN_MAX_ROWS; from += FALLBACK_SCAN_PAGE_SIZE) {
+      if (Date.now() - scanStartedAt > FALLBACK_SCAN_TIME_BUDGET_MS) {
+        console.warn(
+          `[catalog] fallback scan time budget (${FALLBACK_SCAN_TIME_BUDGET_MS}ms) exceeded after ${allRows.length} rows — reporting as partial, never as complete`,
+        )
+        scanIncomplete = true
+        break
+      }
+      const { data, error } = await this.db
+        .from('ai_catalog_products')
+        .select('*')
+        .eq('account_id', this.accountId)
+        .eq('data_source_id', this.dataSourceId)
+        .order('id', { ascending: true })
+        .range(from, from + FALLBACK_SCAN_PAGE_SIZE - 1)
       if (error) {
         console.error('[catalog] fallback scan failed:', error.message)
         return { products: [], total: null, hasMore: false, hadError: true }
       }
-      return { products: [], total: null, hasMore: false }
+      const page = (data ?? []) as CatalogProductRow[]
+      allRows.push(...page)
+      if (page.length < FALLBACK_SCAN_PAGE_SIZE) break
     }
 
-    const rows = (data as CatalogProductRow[]).filter((r) => !args.availableOnly || r.available)
+    const rows = allRows.filter((r) => !args.availableOnly || r.available)
     const ranked = rankBySignificantTokens(
       args.query,
       rows,
@@ -193,12 +247,18 @@ export class DataSourceCatalogProvider implements CatalogProvider {
     // instead (AI Sales Agent audit, Part 9).
     const filtered = [...colorFiltered.filter((m) => m.item.available), ...colorFiltered.filter((m) => !m.item.available)]
     const page = filtered.slice(offset, offset + limit).map((m) => rowToProduct(m.item, this.key, this.label))
-    // `total` here is honestly bounded by FALLBACK_SCAN_LIMIT — this
-    // tier only ever scans the first 500 rows of the data source, so
-    // for a source with more rows than that, a very broad query could
-    // under-count. True for both `total` and `hasMore` alike; noted
-    // rather than silently presented as exact.
-    return { products: page, total: filtered.length, hasMore: offset + page.length < filtered.length }
+    // `total` now reflects the WHOLE data source (paginated above), not
+    // just a fixed first slice — honestly bounded only by
+    // FALLBACK_SCAN_MAX_ROWS, a sanity backstop no real catalog has hit.
+    // `scanIncomplete` (the time-budget cutoff) forces `hasMore: true`
+    // regardless of the local count — `filtered`/`total` only reflect
+    // what was actually scanned before the cutoff, so presenting them
+    // as the complete catalog would be dishonest.
+    return {
+      products: page,
+      total: scanIncomplete ? null : filtered.length,
+      hasMore: scanIncomplete || offset + page.length < filtered.length,
+    }
   }
 
   async getProduct(nativeId: string): Promise<CatalogProduct | null> {
