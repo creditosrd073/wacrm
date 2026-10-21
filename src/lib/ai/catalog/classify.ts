@@ -59,6 +59,30 @@ export function isLikelyAccessoryOrPart(name: string): boolean {
   return ACCESSORY_OR_PART_KEYWORDS.some((kw) => upper.includes(kw))
 }
 
+/**
+ * Curated indicators of a residential/landline phone — a real, distinct
+ * category this catalog actually has (confirmed directly against the
+ * live "Consultas KC" data: "TELEFONO RESIDENCIAL DE SIM CARD HUAWEI",
+ * "TELEFONO RESIDENCIAL MODELO. SPANS"). The incident this closes: a
+ * brand matching only a residential phone must never be reported as
+ * "no smartphones of that brand" (wrong — a non-smartphone product of
+ * that brand DOES exist) nor as "we have a Samsung smartphone" (wrong —
+ * it's a landline). "TELEFONO FIJO"/"TELEFONO DE MESA" are the same
+ * real-world concept under its other common Spanish names, kept narrow
+ * rather than a general thesaurus, same discipline as the accessory list.
+ */
+const RESIDENTIAL_PHONE_KEYWORDS = ['TELEFONO RESIDENCIAL', 'TELEFONO FIJO', 'TELEFONO DE MESA', 'TELEFONO INALAMBRICO']
+
+/**
+ * True only when `name` contains one of the curated residential-phone
+ * keywords above — same "narrow, additive, never a positive claim about
+ * anything else" discipline as `isLikelyAccessoryOrPart`.
+ */
+export function isLikelyResidentialPhone(name: string): boolean {
+  const upper = name.toUpperCase()
+  return RESIDENTIAL_PHONE_KEYWORDS.some((kw) => upper.includes(kw))
+}
+
 /** Category/type words that precede the brand in this catalog's real
  *  naming convention (e.g. "TV SAMSUNG...", "CONTROL REMOTO TV
  *  SAMSUNG..."). Sorted longest-first so a multi-word phrase is
@@ -120,11 +144,20 @@ const DEVICE_NAME_PATTERN = /\d+GB\s*\+\s*\d+GB/i
  * then only ever returns 'likely_device' when there's REAL positive
  * evidence (a recognized naming pattern) — never merely "didn't match
  * a part keyword", which stays 'uncertain' instead.
+ *
+ * 'residential_phone' is checked BEFORE the structured brand/model
+ * fields below: a residential/landline phone is never a smartphone
+ * REGARDLESS of whether `brand`/`model` happen to be populated for it —
+ * those fields describe WHICH brand/model, not WHAT KIND of device, and
+ * conflating "has a brand field" with "likely_device" would silently
+ * reintroduce the same kind of category confusion this module exists
+ * to prevent.
  */
-export type ProductConfidence = 'accessory_or_part' | 'uncertain' | 'likely_device'
+export type ProductConfidence = 'accessory_or_part' | 'residential_phone' | 'uncertain' | 'likely_device'
 
 export function classifyProductConfidence(product: { name: string; brand?: string | null; model?: string | null }): ProductConfidence {
   if (isLikelyAccessoryOrPart(product.name)) return 'accessory_or_part'
+  if (isLikelyResidentialPhone(product.name)) return 'residential_phone'
   // Real structured data, when the catalog actually has it, is
   // stronger evidence than any name heuristic — "usar campos
   // estructurados cuando existan".

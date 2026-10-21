@@ -66,15 +66,19 @@ export const CATALOG_TOOL_SPECS: ToolSpec[] = [
       'Cada producto incluye `is_likely_accessory_or_part` (heurística sobre el nombre real — NUNCA una categoría ' +
       'confirmada): `true` significa que el nombre coincide con un repuesto/accesorio conocido (pantalla, batería, ' +
       'flex, cable, funda, etc.); `false` NO significa que sea un teléfono/TV confirmado, solo que no coincidió con ' +
-      'esos términos. También incluye `product_confidence` con tres valores posibles, ninguno es una certeza del ' +
+      'esos términos. También incluye `product_confidence` con cuatro valores posibles, ninguno es una certeza del ' +
       'catálogo: "accessory_or_part" (repuesto/accesorio probable, igual que is_likely_accessory_or_part=true), ' +
-      '"likely_device" (hay evidencia real — marca/modelo del catálogo, o un nombre con el patrón real de un ' +
-      'teléfono en venta — de que es un dispositivo), "uncertain" (ninguna de las dos cosas — NO asumas que es un ' +
-      'teléfono solo porque el nombre menciona una marca o modelo conocido; dilo como incierto o pide confirmar). ' +
-      'Cuando el cliente pida específicamente teléfonos/televisores (no repuestos ni accesorios), usa estas ' +
-      'señales para excluir de tu respuesta lo que claramente sea un repuesto/accesorio. `facets.productKindSplit` ' +
-      'te dice cuántos de estos resultados parecen repuestos/accesorios frente a dispositivos — si la mayoría son ' +
-      'repuestos, dilo honestamente en vez de presentar la lista como si fueran todos teléfonos.',
+      '"residential_phone" (teléfono residencial/fijo — NUNCA es un smartphone aunque la marca coincida; no cuenta ' +
+      'como respuesta si el cliente pidió celulares/smartphones, pero SÍ es un producto real de esa marca si pidió ' +
+      '"todos los productos" de ella), "likely_device" (hay evidencia real — marca/modelo del catálogo, o un ' +
+      'nombre con el patrón real de un teléfono en venta — de que es un dispositivo), "uncertain" (ninguna de las ' +
+      'anteriores — NO asumas que es un teléfono solo porque el nombre menciona una marca o modelo conocido; dilo ' +
+      'como incierto o pide confirmar). ' +
+      'Cuando el cliente pida específicamente teléfonos/televisores (no repuestos, accesorios ni teléfonos ' +
+      'residenciales), usa estas señales para excluir de tu respuesta lo que claramente no sea un smartphone. ' +
+      '`facets.productKindSplit` te dice cuántos de estos resultados parecen repuestos/accesorios, teléfonos ' +
+      'residenciales, o dispositivos — si la mayoría no son smartphones, dilo honestamente en vez de presentar la ' +
+      'lista como si fueran todos teléfonos.',
     inputSchema: {
       type: 'object',
       properties: {

@@ -659,13 +659,17 @@ describe('Full pipeline — realistic mixed catalog (null brand, repair parts ou
     const executeTool = executeCatalogTool(db, 'acct-1')
     const result = (await executeTool({ id: 'c1', name: 'search_catalog', input: { query: 'samsung', limit: 20 } })) as {
       products: unknown[]
-      facets?: { brandGuesses?: string[]; brands?: string[]; productKindSplit?: { likelyAccessoryOrPart: number; likelyDevice: number } }
+      facets?: {
+        brandGuesses?: string[]
+        brands?: string[]
+        productKindSplit?: { likelyAccessoryOrPart: number; likelyResidentialPhone: number; likelyDevice: number }
+      }
     }
     // 1 real Samsung device (A56) + 5 Samsung-named parts (p1-p5) = 6.
     expect(result.products).toHaveLength(6)
     expect(result.facets?.brands).toBeUndefined()
     expect(result.facets?.brandGuesses).toEqual(['SAMSUNG'])
-    expect(result.facets?.productKindSplit).toEqual({ likelyAccessoryOrPart: 5, likelyDevice: 1 })
+    expect(result.facets?.productKindSplit).toEqual({ likelyAccessoryOrPart: 5, likelyResidentialPhone: 0, likelyDevice: 1 })
   })
 
   it('a device-only query intent ("qué teléfonos tienen") still returns every matching row from a generic query, but the agent has the signal to filter parts out itself', async () => {
@@ -722,12 +726,34 @@ describe('Full pipeline — realistic mixed catalog (null brand, repair parts ou
     const result = (await executeTool({ id: 'c1', name: 'search_catalog', input: { query: 'iphone', limit: 20 } })) as {
       products: unknown[]
       total: number
-      facets?: { productKindSplit?: { likelyAccessoryOrPart: number; likelyDevice: number } }
+      facets?: { productKindSplit?: { likelyAccessoryOrPart: number; likelyResidentialPhone: number; likelyDevice: number } }
     }
     // NOT a confirmed-empty result (there ARE 3 real matches) — a model
     // reading this must say "solo tenemos repuestos, no el teléfono",
     // never "no tenemos nada" and never invent an iPhone to sell.
     expect(result.total).toBe(3)
-    expect(result.facets?.productKindSplit).toEqual({ likelyAccessoryOrPart: 3, likelyDevice: 0 })
+    expect(result.facets?.productKindSplit).toEqual({ likelyAccessoryOrPart: 3, likelyResidentialPhone: 0, likelyDevice: 0 })
+  })
+
+  it('CRITICAL (Mission D): a Samsung residential phone is never presented as a Samsung smartphone, and its presence must not hide that zero real smartphones matched', async () => {
+    // Exact scenario from the mission: a brand search finds zero
+    // smartphones AND a residential phone of that brand — the agent
+    // must distinguish "no Samsung smartphones" from "no Samsung
+    // products at all" (the residential phone IS a real Samsung
+    // product, just not a smartphone).
+    const db = fakeDbWithProducts([
+      rowNullBrand('r1', 'TELEFONO RESIDENCIAL SAMSUNG MODELO X200', { price: 1200 }),
+      rowNullBrand('p1', 'PANTALLA SAMSUNG A56', { price: 2500 }),
+    ])
+    const executeTool = executeCatalogTool(db, 'acct-1')
+    const result = (await executeTool({ id: 'c1', name: 'search_catalog', input: { query: 'samsung', limit: 20 } })) as {
+      products: { name: string; product_confidence: string }[]
+      facets?: { productKindSplit?: { likelyAccessoryOrPart: number; likelyResidentialPhone: number; likelyDevice: number } }
+    }
+    const residential = result.products.find((p) => p.name.includes('RESIDENCIAL'))
+    expect(residential?.product_confidence).toBe('residential_phone')
+    // Zero real smartphones in this result — confirmed by the facet,
+    // not by the model guessing from the residential phone's presence.
+    expect(result.facets?.productKindSplit).toEqual({ likelyAccessoryOrPart: 1, likelyResidentialPhone: 1, likelyDevice: 0 })
   })
 })

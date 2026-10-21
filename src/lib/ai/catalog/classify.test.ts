@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest'
-import { isLikelyAccessoryOrPart, guessBrandFromName, classifyProductConfidence } from './classify'
+import { isLikelyAccessoryOrPart, isLikelyResidentialPhone, guessBrandFromName, classifyProductConfidence } from './classify'
 
 // ============================================================
 // Broad-search reliability audit (Oct 2026) — every fixture name below
@@ -41,6 +41,28 @@ describe('isLikelyAccessoryOrPart', () => {
     // An unrelated/ambiguous name is simply unclassified (false), never
     // a claim it IS a device — see the module's own doc on why.
     expect(isLikelyAccessoryOrPart('ALGO NUNCA VISTO XYZ123')).toBe(false)
+  })
+})
+
+describe('isLikelyResidentialPhone', () => {
+  it('classifies the real residential-phone names from the production catalog', () => {
+    expect(isLikelyResidentialPhone('TELEFONO RESIDENCIAL DE SIM CARD HUAWEI')).toBe(true)
+    expect(isLikelyResidentialPhone('TELEFONO RESIDENCIAL MODELO. SPANS')).toBe(true)
+  })
+
+  it('does NOT classify a real smartphone, TV, or repair part as a residential phone', () => {
+    expect(isLikelyResidentialPhone('SAMSUNG A16 128GB + 4GB GRIS')).toBe(false)
+    expect(isLikelyResidentialPhone('TV SAMSUNG 65 UHD U7900FD')).toBe(false)
+    expect(isLikelyResidentialPhone('PANTALLA SAMSUNG A07')).toBe(false)
+  })
+
+  it('does NOT false-positive on an unrelated "inalambrico" product that is not a phone at all', () => {
+    // Real catalog check (Oct 2026): "%INALAMBRICO%" alone matches 10
+    // real rows, none of them a telephone (mice, keyboards, alarm
+    // sensors) — the keyword list requires "TELEFONO" immediately
+    // before it, not "inalambrico" on its own.
+    expect(isLikelyResidentialPhone('MOUSE Fantech INALAMBRICO Gaming (Mod. WG12RS-NEGRO RAIGOR III)')).toBe(false)
+    expect(isLikelyResidentialPhone('DAHUA SENSOR MOVIMIENTO INALAMBRICO 433MHZ - DHI-ARD1233-W2')).toBe(false)
   })
 })
 
@@ -99,5 +121,13 @@ describe('classifyProductConfidence', () => {
 
   it('blank/whitespace-only brand or model fields are NOT treated as real structured data', () => {
     expect(classifyProductConfidence({ name: 'Samsung A16', brand: '   ', model: '' })).toBe('uncertain')
+  })
+
+  it('CRITICAL (Mission D): a real residential/landline phone is its own category — never "likely_device" (implying smartphone), never "accessory_or_part"', () => {
+    expect(classifyProductConfidence({ name: 'TELEFONO RESIDENCIAL DE SIM CARD HUAWEI' })).toBe('residential_phone')
+  })
+
+  it('a residential phone stays "residential_phone" even when a real brand/model field is populated for it — the category signal wins over the generic structured-data rule', () => {
+    expect(classifyProductConfidence({ name: 'TELEFONO RESIDENCIAL SAMSUNG X200', brand: 'Samsung', model: 'X200' })).toBe('residential_phone')
   })
 })
