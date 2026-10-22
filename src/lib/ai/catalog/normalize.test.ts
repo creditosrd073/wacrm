@@ -1,5 +1,13 @@
 import { describe, it, expect } from 'vitest'
-import { levenshtein, normalizeText, rankBySignificantTokens, significantTokens } from './normalize'
+import {
+  levenshtein,
+  normalizeText,
+  rankBySignificantTokens,
+  rankBySignificantTokensMultiCategory,
+  significantTokens,
+  isBarePhoneCategoryQuery,
+  splitCategorySegments,
+} from './normalize'
 
 describe('normalizeText', () => {
   it('strips diacritics and lowercases', () => {
@@ -320,5 +328,179 @@ describe('rankBySignificantTokens — full audit query list (generic across cate
     expect(verde.item.price).toBe(9000) // same price here, but from ITS OWN row
     expect(negro.item.stock).toBe(5)
     expect(verde.item.stock).toBe(0) // different stock — proves rows are independent, not merged
+  })
+})
+
+// ============================================================
+// Mission E/F audit (Oct 2026) — generic category queries. Real
+// incident: NO phone name in the real "Consultas KC" catalog contains
+// "celular"/"telefono"/"smartphone"/"movil" literally (confirmed by
+// direct, read-only query), so a bare category query like "celulares"
+// previously found nothing, or — worse — accidentally matched the one
+// unrelated product whose name happens to contain "MOVIL" as part of
+// a reseller-name suffix ("TOUCH SAMSUNG S6810 MUNDO MOVIL").
+// ============================================================
+describe('isBarePhoneCategoryQuery', () => {
+  it('recognizes singular and plural phone-category words, in Spanish and their synonyms', () => {
+    for (const q of ['celular', 'celulares', 'telefono', 'telefonos', 'teléfono', 'teléfonos', 'smartphone', 'smartphones', 'movil', 'moviles', 'cel', 'celes']) {
+      expect(isBarePhoneCategoryQuery(q)).toBe(true)
+    }
+  })
+
+  it('is false when the query has a real anchor (brand/model) alongside the category word', () => {
+    // "celular samsung" has a real, text-matchable anchor ("samsung")
+    // — this must go through the NORMAL ranking path, not the bare-
+    // category structural bypass.
+    expect(isBarePhoneCategoryQuery('celular samsung')).toBe(false)
+    expect(isBarePhoneCategoryQuery('samsung a07')).toBe(false)
+  })
+
+  it('is false for an unrelated category (TVs, appliances) or an empty query', () => {
+    expect(isBarePhoneCategoryQuery('televisor')).toBe(false)
+    expect(isBarePhoneCategoryQuery('nevera')).toBe(false)
+    expect(isBarePhoneCategoryQuery('')).toBe(false)
+    expect(isBarePhoneCategoryQuery('   ')).toBe(false)
+  })
+})
+
+describe('splitCategorySegments', () => {
+  it('a query with no comma is returned as its own single-element array, unchanged', () => {
+    expect(splitCategorySegments('Samsung A07')).toEqual(['Samsung A07'])
+  })
+
+  it('splits an explicit comma-separated category list into trimmed segments', () => {
+    expect(splitCategorySegments('neveras, estufas, lavadoras')).toEqual(['neveras', 'estufas', 'lavadoras'])
+  })
+
+  it('drops empty segments from stray/trailing commas', () => {
+    expect(splitCategorySegments('neveras, , estufas,')).toEqual(['neveras', 'estufas'])
+  })
+})
+
+describe('rankBySignificantTokensMultiCategory — multi-category OR semantics (Mission F)', () => {
+  const APPLIANCES = [
+    { name: 'NEVERA MARCA1 10 PIES' },
+    { name: 'ESTUFA MARCA2 5 HORNILLAS' },
+    { name: 'LAVADORA MARCA3 11KG' },
+  ]
+  const text = (p: { name: string }) => p.name
+
+  it('CRITICAL: "neveras, estufas, lavadoras" recovers all three real categories — the strict-majority threshold alone would find none', () => {
+    // Direct proof of the bug this fixes: the single-query path finds
+    // NOTHING, because no product is ever both a nevera AND an estufa.
+    expect(rankBySignificantTokens('neveras, estufas, lavadoras', APPLIANCES, text)).toEqual([])
+
+    const merged = rankBySignificantTokensMultiCategory('neveras, estufas, lavadoras', APPLIANCES, text)
+    expect(merged.map((m) => m.item.name).sort()).toEqual(
+      ['ESTUFA MARCA2 5 HORNILLAS', 'LAVADORA MARCA3 11KG', 'NEVERA MARCA1 10 PIES'],
+    )
+  })
+
+  it('a 2-category OR query ("neveras, lavadoras") recovers both, excluding the unrelated estufa', () => {
+    const merged = rankBySignificantTokensMultiCategory('neveras, lavadoras', APPLIANCES, text)
+    expect(merged.map((m) => m.item.name).sort()).toEqual(['LAVADORA MARCA3 11KG', 'NEVERA MARCA1 10 PIES'])
+  })
+
+  it('CRITICAL: a single query with NO comma delegates unchanged — "Samsung A07" still never returns "Samsung A05"', () => {
+    const PHONES = [
+      { name: 'SAMSUNG A07 128GB NEGRO' },
+      { name: 'SAMSUNG A05 128GB NEGRO' }, // decoy: different model
+    ]
+    const result = rankBySignificantTokensMultiCategory('Samsung A07', PHONES, text)
+    expect(result.length).toBeGreaterThan(0)
+    expect(result.every((r) => r.item.name.includes('A07'))).toBe(true)
+    expect(result.some((r) => r.item.name.includes('A05'))).toBe(false)
+    // Byte-for-byte the same result the single-query function alone gives.
+    expect(result).toEqual(rankBySignificantTokens('Samsung A07', PHONES, text))
+  })
+})
+
+// ============================================================
+// Mission F.2 audit (Oct 2026) — confirmed regression, reproduced by
+// direct execution: the FIRST version of the comma-handling fix
+// (Mission F) treated any non-empty whole-query result as reliable,
+// but plain rankBySignificantTokens on "Samsung A07, el negro" (and
+// even on "Samsung A07 negro" with NO comma at all) already admits
+// "Samsung A05 ... NEGRO" — "samsung" + "negro" alone (2 of 3 tokens)
+// clears the strict-majority threshold without "a07" needing to match
+// anything. This closes that gap WITHOUT touching
+// rankBySignificantTokens itself (see matchesEveryDigitToken's doc).
+// ============================================================
+describe('rankBySignificantTokensMultiCategory — comma as a QUALIFIER for one item, not a category list (Mission F.2)', () => {
+  const MIXED = [
+    { name: 'SAMSUNG A07 128GB NEGRO' },
+    { name: 'SAMSUNG A05 128GB NEGRO' }, // decoy: different model, SAME color
+    { name: 'TV TCL GOOGLE TV SMART 50 4K ULTRA HD NEGRO' }, // unrelated category, also black
+    { name: 'NEVERA GHOME 10 PIES NEGRO' }, // unrelated category, also black
+  ]
+  const text = (p: { name: string }) => p.name
+
+  it('CRITICAL (the confirmed regression): "Samsung A07, el negro" excludes the A05 decoy, the TV, and the nevera — ALL of them share "negro"', () => {
+    // Pre-fix, plain rankBySignificantTokens on this exact string
+    // already returns both A07 and A05 (verified directly) — proving
+    // the gap is NOT introduced by comma-splitting itself, only
+    // exposed by it. The multi-category wrapper must correct it.
+    const result = rankBySignificantTokensMultiCategory('Samsung A07, el negro', MIXED, text)
+    expect(result.map((r) => r.item.name)).toEqual(['SAMSUNG A07 128GB NEGRO'])
+  })
+
+  it('the SAME gap is already present with no comma at all — confirms this is a pre-existing rankBySignificantTokens characteristic, not something comma-handling introduced', () => {
+    const plain = rankBySignificantTokens('Samsung A07 negro', MIXED, text)
+    expect(plain.map((r) => r.item.name)).toContain('SAMSUNG A05 128GB NEGRO') // the gap, unmodified
+  })
+
+  it('"neveras, estufas, lavadoras" is unaffected by the digit-token guard — none of its tokens carry a digit, and the whole query already finds nothing', () => {
+    const APPLIANCES = [
+      { name: 'NEVERA MARCA1 10 PIES' },
+      { name: 'ESTUFA MARCA2 5 HORNILLAS' },
+      { name: 'LAVADORA MARCA3 11KG' },
+    ]
+    const merged = rankBySignificantTokensMultiCategory('neveras, estufas, lavadoras', APPLIANCES, text)
+    expect(merged.map((m) => m.item.name).sort()).toEqual(
+      ['ESTUFA MARCA2 5 HORNILLAS', 'LAVADORA MARCA3 11KG', 'NEVERA MARCA1 10 PIES'],
+    )
+  })
+
+  it('a non-model qualifier with no digit at all ("Samsung, el negro") still excludes unrelated categories via the ordinary majority threshold', () => {
+    const result = rankBySignificantTokensMultiCategory('Samsung, el negro', MIXED, text)
+    expect(result.every((r) => r.item.name.startsWith('SAMSUNG'))).toBe(true)
+    expect(result.some((r) => r.item.name.includes('TV') || r.item.name.includes('NEVERA'))).toBe(false)
+  })
+})
+
+describe('rankBySignificantTokensMultiCategory — a per-segment strategy override resolves mixed category lists (Mission F.2)', () => {
+  // A minimal stand-in for DataSourceCatalogProvider's real
+  // rankRowsForSegment (classify.ts-aware): the SAME real trigger
+  // (isBarePhoneCategoryQuery) this function already uses internally
+  // to decide whether a segment needs non-textual handling, paired
+  // with a toy "structural" selector (every candidate whose name
+  // contains "DEVICE") standing in for classify.ts's real
+  // classifyProductConfidence — kept here purely textual so this test
+  // stays scoped to normalize.ts's own contract, without importing
+  // classify.ts into a normalize.ts test.
+  function rankSegmentStub<T extends { name: string }>(segmentQuery: string, items: T[], getText: (i: T) => string) {
+    if (isBarePhoneCategoryQuery(segmentQuery)) {
+      return items.filter((i) => i.name.includes('DEVICE')).map((item) => ({ item, score: 0, matchedTokens: 0 }))
+    }
+    return rankBySignificantTokens(segmentQuery, items, getText)
+  }
+
+  it('CRITICAL: "celulares, neveras" resolves the "celulares" segment structurally AND the "neveras" segment textually — neither is lost', () => {
+    const MIXED = [
+      { name: 'DEVICE-SHAPED-ROW-1' },
+      { name: 'DEVICE-SHAPED-ROW-2' },
+      { name: 'NEVERA GHOME 10 PIES' },
+    ]
+    const text = (p: { name: string }) => p.name
+    // Proof this NEEDS the per-segment path: the whole-query shortcut
+    // alone (default rankSegment) finds only the nevera — the generic
+    // "a token matching nothing anywhere is a droppable qualifier"
+    // relaxation silently treats "celulares" as noise instead of its
+    // own category (the exact Mission F.2 regression).
+    const withoutOverride = rankBySignificantTokensMultiCategory('celulares, neveras', MIXED, text)
+    expect(withoutOverride.map((r) => r.item.name)).toEqual(['NEVERA GHOME 10 PIES'])
+
+    const result = rankBySignificantTokensMultiCategory('celulares, neveras', MIXED, text, rankSegmentStub)
+    expect(result.map((r) => r.item.name).sort()).toEqual(['DEVICE-SHAPED-ROW-1', 'DEVICE-SHAPED-ROW-2', 'NEVERA GHOME 10 PIES'])
   })
 })

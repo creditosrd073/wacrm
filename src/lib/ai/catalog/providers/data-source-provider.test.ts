@@ -476,3 +476,256 @@ describe('DataSourceCatalogProvider — fallback scan time budget: a slow multi-
     }
   })
 })
+
+// ============================================================
+// Mission E/F audit (Oct 2026) — bare phone-category queries
+// ("celulares", "teléfonos") bypass text matching entirely, going
+// straight to classify.ts's structural device-naming selection. Real
+// incident this closes: NO real phone name in the "Consultas KC"
+// catalog contains "celular"/"telefono"/"smartphone" literally, and
+// the one accidental hit that DOES exist ("TOUCH SAMSUNG S6810 MUNDO
+// MOVIL" — "MOVIL" there is a reseller-name fragment) used to get
+// presented as if it were the only/representative phone in stock.
+// ============================================================
+describe('DataSourceCatalogProvider.searchCatalog — bare phone-category queries bypass text matching entirely (Mission F)', () => {
+  it('CRITICAL: "celulares" finds real phones via the device-naming pattern even though NO real name contains the word "celular" — never touches the SQL tier at all', async () => {
+    const realPhones = [
+      row({ id: 'p1', source_product_id: 'p1', name: 'SAMSUNG A26 5G 128GB + 6GB NEGRO', brand: null, model: null }),
+      row({ id: 'p2', source_product_id: 'p2', name: 'MOTOROLA G06 64GB + 4GB NARANJA', brand: null, model: null }),
+    ]
+    const { db, rpcCalls } = fakeDb({ scanRows: realPhones })
+    const provider = new DataSourceCatalogProvider(db, 'acct-1', 'ds-1', 'PRUEBA')
+
+    const result = await provider.searchCatalog({ query: 'celulares', limit: 20 })
+    expect(rpcCalls).toHaveLength(0) // confirms the SQL ILIKE/FTS tier was never even tried
+    expect(result.products.map((p) => p.name).sort()).toEqual([
+      'MOTOROLA G06 64GB + 4GB NARANJA',
+      'SAMSUNG A26 5G 128GB + 6GB NEGRO',
+    ])
+    expect(result.matchedByInferredCategory).toBe(true)
+  })
+
+  it('CRITICAL (the real reported incident): an accessory whose name incidentally contains "MOVIL" is NEVER returned as if it represented the phone category', async () => {
+    const mixedRows = [
+      row({ id: 'p1', source_product_id: 'p1', name: 'SAMSUNG A26 5G 128GB + 6GB NEGRO', brand: null, model: null }),
+      row({ id: 'p2', source_product_id: 'p2', name: 'SAMSUNG A36 5G 128GB + 8GB BLANCO', brand: null, model: null }),
+      // The real incident's exact product name — no GB+GB device
+      // pattern, no real brand/model field, nothing structurally
+      // device-shaped; "MOVIL" is incidental (a reseller-name suffix).
+      row({ id: 'p3', source_product_id: 'p3', name: 'TOUCH SAMSUNG S6810 MUNDO MOVIL', brand: null, model: null }),
+    ]
+    const { db } = fakeDb({ scanRows: mixedRows })
+    const provider = new DataSourceCatalogProvider(db, 'acct-1', 'ds-1', 'PRUEBA')
+
+    const result = await provider.searchCatalog({ query: 'celular', limit: 20 })
+    const names = result.products.map((p) => p.name)
+    expect(names).toContain('SAMSUNG A26 5G 128GB + 6GB NEGRO')
+    expect(names).toContain('SAMSUNG A36 5G 128GB + 8GB BLANCO')
+    expect(names).not.toContain('TOUCH SAMSUNG S6810 MUNDO MOVIL')
+  })
+
+  it('a bare category query with genuinely ZERO real devices (only accessories) reports a confirmed-empty result — never an error, never an invented product', async () => {
+    const onlyAccessories = [
+      row({ id: 'a1', source_product_id: 'a1', name: 'CABLE HDMI A CELULAR CG586-1.8', brand: null, model: null }),
+    ]
+    const { db } = fakeDb({ scanRows: onlyAccessories })
+    const provider = new DataSourceCatalogProvider(db, 'acct-1', 'ds-1', 'PRUEBA')
+
+    const result = await provider.searchCatalog({ query: 'celulares', limit: 20 })
+    expect(result.products).toEqual([])
+    expect(result.total).toBe(0)
+    expect(result.hasMore).toBe(false)
+    expect(result.hadError).toBeUndefined()
+    expect(result.matchedByInferredCategory).toBe(true)
+  })
+
+  it('a query WITH a real anchor ("celular samsung") is NOT a bare category query — still goes through the normal RPC tier unchanged', async () => {
+    const { db, rpcCalls } = fakeDb({ rpcRows: [row({ total_count: 1 })] })
+    const provider = new DataSourceCatalogProvider(db, 'acct-1', 'ds-1', 'PRUEBA')
+    await provider.searchCatalog({ query: 'celular samsung' })
+    expect(rpcCalls).toHaveLength(1)
+  })
+})
+
+describe('DataSourceCatalogProvider.searchCatalog — multi-category OR queries ("neveras, estufas, lavadoras") (Mission F)', () => {
+  it('recovers all three real categories once the DB tier finds nothing for the combined comma-joined string', async () => {
+    const appliances = [
+      row({ id: 'n1', source_product_id: 'n1', name: 'NEVERA GHOME 10 PIES', brand: null }),
+      row({ id: 'e1', source_product_id: 'e1', name: 'ESTUFA ELECTRICA 832-9500', brand: null }),
+      row({ id: 'l1', source_product_id: 'l1', name: 'LAVADORA BLACK + DECKER 11KG', brand: null }),
+    ]
+    const { db } = fakeDb({ rpcRows: [], scanRows: appliances })
+    const provider = new DataSourceCatalogProvider(db, 'acct-1', 'ds-1', 'PRUEBA')
+
+    const result = await provider.searchCatalog({ query: 'neveras, estufas, lavadoras', limit: 20 })
+    expect(result.products.map((p) => p.name).sort()).toEqual([
+      'ESTUFA ELECTRICA 832-9500',
+      'LAVADORA BLACK + DECKER 11KG',
+      'NEVERA GHOME 10 PIES',
+    ])
+  })
+})
+
+describe('DataSourceCatalogProvider.searchCatalog — short bare-word query ("TV") excludes an adapter false positive (Mission F)', () => {
+  it('CRITICAL: "TV" excludes "...VGA2HDTV" adapters while keeping real TVs — real names from the "Consultas KC" catalog', async () => {
+    const realTv = row({ id: 't1', source_product_id: 't1', name: 'TV SAMSUNG 65 UHD U7900FD', total_count: 2 })
+    const falsePositive = row({
+      id: 'a1',
+      source_product_id: 'a1',
+      name: 'ADAPTADOR CONVERTIDOR CAJA VGA TO HDMI / VGA2HDTV',
+      total_count: 2,
+    })
+    const { db } = fakeDb({ rpcRows: [realTv, falsePositive] })
+    const provider = new DataSourceCatalogProvider(db, 'acct-1', 'ds-1', 'PRUEBA')
+
+    const result = await provider.searchCatalog({ query: 'TV', limit: 10, offset: 0 })
+    expect(result.products).toHaveLength(1)
+    expect(result.products[0].name).toBe('TV SAMSUNG 65 UHD U7900FD')
+    // Last/only page (offset+rows=2 === total=2) — post-filter total is
+    // still exactly knowable: 2 - 1 false positive = 1.
+    expect(result.total).toBe(1)
+    expect(result.hasMore).toBe(false)
+  })
+
+  it('a real TV name that already has "TV" at a genuine word boundary is completely unaffected', async () => {
+    const rows = [row({ total_count: 1 })] // default fixture name: 'TV TCL GOOGLE TV 50 4K'
+    const { db } = fakeDb({ rpcRows: rows })
+    const provider = new DataSourceCatalogProvider(db, 'acct-1', 'ds-1', 'PRUEBA')
+    const result = await provider.searchCatalog({ query: 'TV', limit: 10 })
+    expect(result.products).toHaveLength(1)
+    expect(result.total).toBe(1)
+  })
+})
+
+// ============================================================
+// Mission F.2 audit (Oct 2026) — regression found and fixed after the
+// original Mission F review: "celulares, neveras" (a bare phone
+// category COMBINED with another real category via comma) used to
+// silently drop the phones entirely — the whole-comma-joined-string
+// shortcut treated the un-matchable "celulares" token as a droppable
+// qualifier (the same relaxation that lets "una laptop barata" ignore
+// "barata") and returned only the nevera. Fixed by recognizing that
+// ANY segment independently qualifying as a bare phone-category query
+// means this is a genuine multi-category list, never a single-item
+// qualifier — see normalize.ts::rankBySignificantTokensMultiCategory's
+// `needsPerSegmentHandling` and DataSourceCatalogProvider's own
+// `rankRowsForSegment`.
+// ============================================================
+describe('DataSourceCatalogProvider.searchCatalog — a phone category combined with another category via comma resolves BOTH (Mission F.2)', () => {
+  it('CRITICAL: "celulares, neveras" returns real phones (structural) AND the real nevera (textual) — neither is dropped', async () => {
+    const mixedRows = [
+      row({ id: 'p1', source_product_id: 'p1', name: 'SAMSUNG A26 5G 128GB + 6GB NEGRO', brand: null, model: null }),
+      row({ id: 'p2', source_product_id: 'p2', name: 'MOTOROLA G06 64GB + 4GB NARANJA', brand: null, model: null }),
+      row({ id: 'n1', source_product_id: 'n1', name: 'NEVERA GHOME 10 PIES', brand: null }),
+    ]
+    const { db, rpcCalls } = fakeDb({ rpcRows: [], scanRows: mixedRows })
+    const provider = new DataSourceCatalogProvider(db, 'acct-1', 'ds-1', 'PRUEBA')
+
+    const result = await provider.searchCatalog({ query: 'celulares, neveras', limit: 20 })
+    expect(rpcCalls).toHaveLength(1) // the RPC WAS tried (this isn't a bare single-category query — searchCatalog's own top-level bypass only fires for THAT case)
+    expect(result.products.map((p) => p.name).sort()).toEqual([
+      'MOTOROLA G06 64GB + 4GB NARANJA',
+      'NEVERA GHOME 10 PIES',
+      'SAMSUNG A26 5G 128GB + 6GB NEGRO',
+    ])
+    // Honestly flagged — part of this result WAS structurally inferred.
+    expect(result.matchedByInferredCategory).toBe(true)
+  })
+
+  it('a bare single-category query ("celulares" alone, no comma) still bypasses the RPC tier entirely, unaffected by the F.2 fix', async () => {
+    const realPhones = [row({ id: 'p1', source_product_id: 'p1', name: 'SAMSUNG A26 5G 128GB + 6GB NEGRO', brand: null, model: null })]
+    const { db, rpcCalls } = fakeDb({ scanRows: realPhones })
+    const provider = new DataSourceCatalogProvider(db, 'acct-1', 'ds-1', 'PRUEBA')
+    const result = await provider.searchCatalog({ query: 'celulares', limit: 20 })
+    expect(rpcCalls).toHaveLength(0)
+    expect(result.products).toHaveLength(1)
+  })
+})
+
+describe('DataSourceCatalogProvider.searchCatalog — the bare-category structural route paginates correctly (Mission F.2)', () => {
+  it('offset > 0 returns the correct slice, with has_more/total computed over ALL real devices, not just the first page', async () => {
+    const devices = Array.from({ length: 5 }, (_, i) =>
+      row({
+        id: `d${i}`,
+        source_product_id: `d${i}`,
+        name: `MARCA MODELO${i} 64GB + 4GB NEGRO`,
+        brand: null,
+        model: null,
+      }),
+    )
+    const { db } = fakeDb({ scanRows: devices })
+    const provider = new DataSourceCatalogProvider(db, 'acct-1', 'ds-1', 'PRUEBA')
+
+    const page1 = await provider.searchCatalog({ query: 'celulares', limit: 2, offset: 0 })
+    expect(page1.products).toHaveLength(2)
+    expect(page1.total).toBe(5)
+    expect(page1.hasMore).toBe(true)
+
+    const page2 = await provider.searchCatalog({ query: 'celulares', limit: 2, offset: 2 })
+    expect(page2.products).toHaveLength(2)
+    expect(page2.hasMore).toBe(true)
+    // Deterministic alphabetical order (searchByInferredDeviceCategory
+    // sorts by name) — page 2 must never repeat page 1's products.
+    expect(page1.products.map((p) => p.id)).not.toEqual(expect.arrayContaining(page2.products.map((p) => p.id)))
+
+    const page3 = await provider.searchCatalog({ query: 'celulares', limit: 2, offset: 4 })
+    expect(page3.products).toHaveLength(1)
+    expect(page3.hasMore).toBe(false)
+  })
+
+  it('a scan cut short by the time budget reports hasMore: true / total: null — never a false "complete" list', async () => {
+    vi.useFakeTimers()
+    try {
+      let rangeCalls = 0
+      const db = {
+        rpc: async () => ({ data: [], error: null }),
+        from: (table: string) => {
+          if (table !== 'ai_catalog_products') throw new Error(`unexpected table ${table}`)
+          const api = {
+            select: () => api,
+            eq: () => api,
+            order: () => api,
+            range: async (from: number, to: number) => {
+              rangeCalls++
+              vi.advanceTimersByTime(5_000)
+              const page = Array.from({ length: 1000 }, (_, i) =>
+                row({ id: `row-${from + i}`, source_product_id: `row-${from + i}`, name: `MARCA MODELO${from + i} 64GB + 4GB NEGRO`, brand: null }),
+              )
+              void to
+              return { data: page, error: null }
+            },
+          }
+          return api
+        },
+      } as unknown as SupabaseClient
+      const provider = new DataSourceCatalogProvider(db, 'acct-1', 'ds-1', 'PRUEBA')
+
+      const result = await provider.searchCatalog({ query: 'celulares', limit: 10 })
+
+      expect(rangeCalls).toBe(2) // same cutoff math as fallbackSearch's own test — shared scanAllRows()
+      expect(result.hasMore).toBe(true)
+      expect(result.total).toBeNull() // honestly unknown, never presented as the full device list
+      expect(result.matchedByInferredCategory).toBe(true)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+})
+
+describe('DataSourceCatalogProvider.searchCatalog — the structural route trusts real brand/model fields, not only the name pattern (Mission F.2)', () => {
+  it('a device with real brand/model fields but a name that does NOT follow the "GB + GB" convention is still selected', async () => {
+    const atypicallyNamed = row({
+      id: 'd1',
+      source_product_id: 'd1',
+      name: 'Galaxy Ultra 256GB/12GB RAM', // deliberately NOT the "X GB + Y GB" pattern
+      brand: 'Samsung',
+      model: 'S24 Ultra',
+    })
+    const accessory = row({ id: 'a1', source_product_id: 'a1', name: 'CABLE USB-C GENERICO', brand: null, model: null })
+    const { db } = fakeDb({ scanRows: [atypicallyNamed, accessory] })
+    const provider = new DataSourceCatalogProvider(db, 'acct-1', 'ds-1', 'PRUEBA')
+
+    const result = await provider.searchCatalog({ query: 'celulares', limit: 20 })
+    expect(result.products.map((p) => p.name)).toEqual(['Galaxy Ultra 256GB/12GB RAM'])
+  })
+})

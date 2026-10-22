@@ -13,7 +13,14 @@
 import type { SupabaseClient } from '@supabase/supabase-js'
 import { encodeCatalogId } from '../id'
 import { toCatalogProduct } from '../whitelist'
-import { rankBySignificantTokens } from '../normalize'
+import {
+  rankBySignificantTokens,
+  rankBySignificantTokensMultiCategory,
+  isBarePhoneCategoryQuery,
+  splitCategorySegments,
+  type ScoredMatch,
+} from '../normalize'
+import { classifyProductConfidence } from '../classify'
 import type {
   CatalogAvailability,
   CatalogMedia,
@@ -110,6 +117,19 @@ export function dataSourceProviderKey(dataSourceId: string): string {
  *  as the same product (the mandatory "A26, A36, A37, A56" test case). */
 const MODEL_CODE_QUERY_PATTERN = /^[a-z]{1,3}\d{1,4}$/i
 
+/** A short (<=3 letters), bare alphabetic query — "TV", "AC". Mission F
+ *  audit (Oct 2026): confirmed directly against the real "Consultas
+ *  KC" catalog that querying "TV" via migration 047's
+ *  `name ILIKE '%TV%'` matches 41 rows, mostly unrelated accessories
+ *  whose name merely CONTAINS "tv" embedded in a longer run (e.g.
+ *  "...VGA2HDTV", "...EP-TVA8") — the exact same substring-embedding
+ *  defect as the model-code case above, just without any digit.
+ *  Longer words (brand names) are deliberately excluded: a longer
+ *  token embedded inside an unrelated word is far less evidenced as a
+ *  real problem, and the extra strictness isn't worth risking a
+ *  genuine partial-name match. */
+const SHORT_BARE_WORD_QUERY_PATTERN = /^[a-z]{1,3}$/i
+
 /** True when `token` appears in `name` at a genuine word boundary —
  *  bounded by the string's edges or a non-alphanumeric character on
  *  each side — never merely as a substring of a longer alphanumeric
@@ -156,6 +176,23 @@ export class DataSourceCatalogProvider implements CatalogProvider {
   }
 
   async searchCatalog(args: CatalogSearchArgs): Promise<CatalogSearchResult> {
+    // Mission E/F audit (Oct 2026) — a bare phone-category query
+    // ("celulares", "teléfonos", "smartphones") has no real anchor to
+    // text-match: confirmed directly against the real "Consultas KC"
+    // catalog that NO real phone name contains any of these words, and
+    // that the one accidental hit that DOES exist ("TOUCH SAMSUNG
+    // S6810 MUNDO MOVIL" — "MOVIL" there is a reseller-name fragment,
+    // not a category word) gets wrongly presented as if it were the
+    // only/representative phone in stock. Skip BOTH the SQL ILIKE/FTS
+    // tier and the normal text-ranking fallback tier entirely for this
+    // narrow, well-evidenced query shape, and go straight to a
+    // STRUCTURAL selection instead (classify.ts's device-naming
+    // heuristic / real brand+model fields) — see
+    // searchByInferredDeviceCategory below.
+    const bareQuery = (args.query ?? '').trim()
+    if (isBarePhoneCategoryQuery(bareQuery)) {
+      return this.searchByInferredDeviceCategory(args)
+    }
     const limit = args.limit ?? 10
     const offset = args.offset ?? 0
     const { data, error } = await this.db.rpc('search_ai_catalog_products', {
@@ -175,16 +212,17 @@ export class DataSourceCatalogProvider implements CatalogProvider {
     }
     const rows = (data ?? []) as CatalogProductRowWithTotal[]
     const trimmedQuery = (args.query ?? '').trim()
-    const isModelCodeQuery = MODEL_CODE_QUERY_PATTERN.test(trimmedQuery)
+    const needsWordBoundaryFilter =
+      MODEL_CODE_QUERY_PATTERN.test(trimmedQuery) || SHORT_BARE_WORD_QUERY_PATTERN.test(trimmedQuery)
     if (rows.length > 0) {
       const total = Number(rows[0].total_count ?? rows.length)
       const hasMoreFromDb = offset + rows.length < total
-      if (!isModelCodeQuery) {
+      if (!needsWordBoundaryFilter) {
         return { products: rows.map((r) => rowToProduct(r, this.key, this.label)), total, hasMore: hasMoreFromDb }
       }
-      // ILIKE's plain substring match let a model-code query match a
-      // longer, unrelated code — drop rows that aren't a genuine
-      // word-boundary hit before this ever reaches the model.
+      // ILIKE's plain substring match let a short/model-code query
+      // match a longer, unrelated word/code — drop rows that aren't a
+      // genuine word-boundary hit before this ever reaches the model.
       const boundaryMatched = rows.filter((r) => hasWordBoundaryMatch(r.name, trimmedQuery))
       const removed = rows.length - boundaryMatched.length
       if (boundaryMatched.length > 0) {
@@ -230,20 +268,24 @@ export class DataSourceCatalogProvider implements CatalogProvider {
     return this.fallbackSearch(args)
   }
 
-  private async fallbackSearch(args: CatalogSearchArgs): Promise<CatalogSearchResult> {
-    const limit = args.limit ?? 10
-    const offset = args.offset ?? 0
-
-    // Broad-search reliability audit (Oct 2026) — paginates through the
-    // WHOLE data source (bounded only by FALLBACK_SCAN_MAX_ROWS as a
-    // sanity backstop, not by a fixed page that silently hid everything
-    // past it) rather than one capped `.limit()` call — see
-    // FALLBACK_SCAN_PAGE_SIZE's doc for the real incident this fixes.
-    // Deterministic base order (`id` ascending) preserved exactly as
-    // before — without it Postgres doesn't guarantee the same row order
-    // across separate calls, and since rankBySignificantTokens' sort is
-    // stable (ties keep INPUT order), an undeterministic scan would
-    // make pagination within this tier flaky across separate calls.
+  /**
+   * Paginates through the WHOLE data source (bounded only by
+   * FALLBACK_SCAN_MAX_ROWS as a sanity backstop, not by a fixed page
+   * that silently hides everything past it) — see
+   * FALLBACK_SCAN_PAGE_SIZE's doc for the real incident this fixes.
+   * Deterministic base order (`id` ascending) preserved exactly as
+   * before — without it Postgres doesn't guarantee the same row order
+   * across separate calls, and since both rankBySignificantTokens' and
+   * searchByInferredDeviceCategory's sorts are stable, a
+   * nondeterministic scan would make pagination within either tier
+   * flaky across separate calls.
+   *
+   * Shared by `fallbackSearch` (text-ranking tier) and
+   * `searchByInferredDeviceCategory` (structural-selection tier) —
+   * extracted so the two tiers can never silently diverge in how they
+   * scan/paginate/time-bound the same underlying rows.
+   */
+  private async scanAllRows(): Promise<{ rows: CatalogProductRow[]; scanIncomplete: boolean; hadError: boolean }> {
     const allRows: CatalogProductRow[] = []
     const scanStartedAt = Date.now()
     // True only if the time budget cut the scan short WHILE more pages
@@ -267,18 +309,100 @@ export class DataSourceCatalogProvider implements CatalogProvider {
         .range(from, from + FALLBACK_SCAN_PAGE_SIZE - 1)
       if (error) {
         console.error('[catalog] fallback scan failed:', error.message)
-        return { products: [], total: null, hasMore: false, hadError: true }
+        return { rows: [], scanIncomplete: false, hadError: true }
       }
       const page = (data ?? []) as CatalogProductRow[]
       allRows.push(...page)
       if (page.length < FALLBACK_SCAN_PAGE_SIZE) break
     }
+    return { rows: allRows, scanIncomplete, hadError: false }
+  }
+
+  /**
+   * Real rows classified as `classifyProductConfidence() ===
+   * 'likely_device'` (real brand/model fields, or the real
+   * "<storage>GB + <RAM>GB" device-naming pattern), deterministically
+   * sorted. Shared by `searchByInferredDeviceCategory` (the standalone
+   * bare-category bypass) and `rankRowsForSegment` (one segment of a
+   * comma-separated multi-category query, Mission F.2) so the two
+   * never silently diverge in what counts as a real device.
+   */
+  private selectDeviceRows(rows: CatalogProductRow[]): CatalogProductRow[] {
+    return rows.filter((r) => classifyProductConfidence(r) === 'likely_device').sort((a, b) => a.name.localeCompare(b.name))
+  }
+
+  /**
+   * Structural fallback for a bare phone-category query (see
+   * isBarePhoneCategoryQuery's doc) — selects rows by
+   * classifyProductConfidence() === 'likely_device' instead of any
+   * textual match against the query. Every returned product is a REAL
+   * row with real price/stock — this only changes the SELECTION
+   * criterion, never invents a product. Accessories, residential
+   * phones, and anything merely "uncertain" are excluded by
+   * construction (classifyProductConfidence's own priority order),
+   * which is what keeps the real incident (a residential-phone-
+   * adjacent accessory mislabeled as "the only celular") from
+   * recurring here.
+   */
+  private async searchByInferredDeviceCategory(args: CatalogSearchArgs): Promise<CatalogSearchResult> {
+    const limit = args.limit ?? 10
+    const offset = args.offset ?? 0
+    const { rows: allRows, scanIncomplete, hadError } = await this.scanAllRows()
+    if (hadError) return { products: [], total: null, hasMore: false, hadError: true }
 
     const rows = allRows.filter((r) => !args.availableOnly || r.available)
-    const ranked = rankBySignificantTokens(
+    const deviceRows = this.selectDeviceRows(rows)
+    const colorFiltered = args.color
+      ? deviceRows.filter((r) => !r.color || r.color.toLowerCase().includes(args.color!.toLowerCase()))
+      : deviceRows
+    const filtered = [...colorFiltered.filter((r) => r.available), ...colorFiltered.filter((r) => !r.available)]
+    const page = filtered.slice(offset, offset + limit).map((r) => rowToProduct(r, this.key, this.label))
+    return {
+      products: page,
+      total: scanIncomplete ? null : filtered.length,
+      hasMore: scanIncomplete || offset + page.length < filtered.length,
+      matchedByInferredCategory: true,
+    }
+  }
+
+  /**
+   * Ranks ONE segment of a (possibly comma-separated) query against
+   * `rows` — the per-segment strategy `rankBySignificantTokensMultiCategory`
+   * (normalize.ts) delegates to. Mission F.2 audit (Oct 2026): a
+   * combined query like "celulares, neveras" must resolve EACH
+   * category with its OWN correct strategy — the "celulares" segment
+   * structurally (classify.ts, same as the standalone bypass; real
+   * phone names never contain that word literally — see
+   * isBarePhoneCategoryQuery's doc), the "neveras" segment textually
+   * (real nevera names DO contain that word) — never forcing one
+   * strategy on both. `isBarePhoneCategoryQuery` itself is NEVER
+   * loosened: it still requires the SEGMENT to carry no other anchor,
+   * so "celular samsung" (as its own segment) still resolves textually.
+   */
+  private rankRowsForSegment(segmentQuery: string, rows: CatalogProductRow[]): ScoredMatch<CatalogProductRow>[] {
+    if (isBarePhoneCategoryQuery(segmentQuery)) {
+      return this.selectDeviceRows(rows).map((item) => ({ item, score: 0, matchedTokens: 0 }))
+    }
+    return rankBySignificantTokens(
+      segmentQuery,
+      rows,
+      (r) => [r.name, r.sku, r.brand, r.model, r.color, r.capacity, r.size].filter(Boolean).join(' '),
+    )
+  }
+
+  private async fallbackSearch(args: CatalogSearchArgs): Promise<CatalogSearchResult> {
+    const limit = args.limit ?? 10
+    const offset = args.offset ?? 0
+
+    const { rows: allRows, scanIncomplete, hadError } = await this.scanAllRows()
+    if (hadError) return { products: [], total: null, hasMore: false, hadError: true }
+
+    const rows = allRows.filter((r) => !args.availableOnly || r.available)
+    const ranked = rankBySignificantTokensMultiCategory(
       args.query,
       rows,
       (r) => [r.name, r.sku, r.brand, r.model, r.color, r.capacity, r.size].filter(Boolean).join(' '),
+      (segmentQuery, items) => this.rankRowsForSegment(segmentQuery, items),
     )
     const colorFiltered = args.color
       ? ranked.filter((m) => !m.item.color || m.item.color.toLowerCase().includes(args.color!.toLowerCase()))
@@ -299,10 +423,18 @@ export class DataSourceCatalogProvider implements CatalogProvider {
     // regardless of the local count — `filtered`/`total` only reflect
     // what was actually scanned before the cutoff, so presenting them
     // as the complete catalog would be dishonest.
+    //
+    // Mission F.2 — honestly flagged when ANY segment of a combined
+    // query ("celulares, neveras") was resolved structurally rather
+    // than textually, same discipline as searchByInferredDeviceCategory
+    // — never silently hidden just because other segments resolved
+    // normally.
+    const anySegmentIsBarePhoneCategory = splitCategorySegments(args.query).some((s) => isBarePhoneCategoryQuery(s))
     return {
       products: page,
       total: scanIncomplete ? null : filtered.length,
       hasMore: scanIncomplete || offset + page.length < filtered.length,
+      ...(anySegmentIsBarePhoneCategory ? { matchedByInferredCategory: true } : {}),
     }
   }
 
