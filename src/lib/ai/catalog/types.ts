@@ -131,6 +131,19 @@ export interface CatalogSearchResult {
    *  one source erroring sets this false (or omits it) — the search
    *  genuinely succeeded from the customer's perspective. */
   hadError?: boolean
+  /** Mission F audit (Oct 2026) — true when `products` was selected by
+   *  a STRUCTURAL pattern (classify.ts's device-naming heuristic / real
+   *  brand+model fields) instead of a textual match against the query,
+   *  because the query was a bare category word ("celulares",
+   *  "teléfonos") that genuinely doesn't appear in any real product
+   *  name in this catalog (confirmed directly against production — see
+   *  catalog/normalize.ts::isBarePhoneCategoryQuery's doc). Every
+   *  product returned is still 100% real, with real price/stock —
+   *  this flag exists only so the caller/model can be honest that the
+   *  selection itself is inferred, not an exact category filter, and
+   *  therefore not guaranteed exhaustive OR free of the occasional
+   *  miscategorized item. */
+  matchedByInferredCategory?: boolean
 }
 
 export interface CatalogAvailability {

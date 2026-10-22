@@ -620,7 +620,17 @@ function fakeDbWithProducts(products: ReturnType<typeof row>[]): SupabaseClient 
             return Promise.resolve({ data: products.find((p) => p.source_product_id === spid) ?? null, error: null })
           },
           order: () => api,
-          limit: () => Promise.resolve({ data: products, error: null }),
+          // Mission F audit (Oct 2026) — the fallback-scan tier
+          // (data-source-provider.ts) paginates via .range(), not
+          // .limit(), since the broad-search reliability audit; this
+          // helper's own .range() was missing (unlike the module-level
+          // fakeDb() above and data-source-provider.test.ts's own
+          // fakeDb()), which every PRIOR test using fakeDbWithProducts
+          // happened never to exercise (they all got a non-empty match
+          // from the RPC mock below, so they never fell through to a
+          // real scan) — the bare-category bypass (searchByInferred
+          // DeviceCategory) is the first path to call it unconditionally.
+          range: (from: number, to: number) => Promise.resolve({ data: products.slice(from, to + 1), error: null }),
         }
         return api
       }
@@ -755,5 +765,66 @@ describe('Full pipeline — realistic mixed catalog (null brand, repair parts ou
     // Zero real smartphones in this result — confirmed by the facet,
     // not by the model guessing from the residential phone's presence.
     expect(result.facets?.productKindSplit).toEqual({ likelyAccessoryOrPart: 1, likelyResidentialPhone: 1, likelyDevice: 0 })
+  })
+})
+
+// ============================================================
+// Mission F audit (Oct 2026) — real incident: a bare category question
+// ("¿qué celulares tienen?") used to find nothing by text (no real
+// phone name contains "celular"), forcing a model to either give up or
+// retry with equivalent synonyms until the tool budget ran out. Proves,
+// through the REAL tool-calling loop (generateReply → executeCatalogTool
+// → resolver → DataSourceCatalogProvider, nothing mocked below the
+// scripted fetch response), that the structural bare-category fallback
+// already resolves this in ONE search_catalog call.
+// ============================================================
+describe('Full pipeline — a bare category query resolves real phones in ONE call, never exhausting the tool budget (Mission F)', () => {
+  it('search_catalog("celulares") returns real devices (category_inferred: true), excludes the repair part, and the turn finishes without a handoff', async () => {
+    const db = fakeDbWithProducts([
+      rowNullBrand('d1', 'SAMSUNG A26 5G 128GB + 6GB NEGRO', { price: 15000 }),
+      rowNullBrand('d2', 'MOTOROLA G06 64GB + 4GB NARANJA', { price: 7000 }),
+      rowNullBrand('p1', 'PANTALLA SAMSUNG A56', { price: 2500 }),
+    ])
+
+    const FINAL_TEXT =
+      'Tenemos el SAMSUNG A26 5G 128GB + 6GB NEGRO (RD$15,000) y el MOTOROLA G06 64GB + 4GB NARANJA (RD$7,000). ¿Te interesa alguno?'
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(
+        okResponse({
+          choices: [
+            {
+              message: {
+                content: null,
+                tool_calls: [{ id: 'c1', type: 'function', function: { name: 'search_catalog', arguments: '{"query":"celulares","limit":20}' } }],
+              },
+            },
+          ],
+        }),
+      )
+      .mockResolvedValueOnce(okResponse({ choices: [{ message: { content: FINAL_TEXT } }] }))
+    vi.stubGlobal('fetch', fetchMock)
+    try {
+      const result = await turn({ userMessage: '¿Qué celulares tienen?', previousContext: null, db })
+
+      // Exactly ONE search_catalog call — the structural fallback
+      // already returned real, usable devices on the first try, so a
+      // reasonably-behaved model never needs to retry with equivalent
+      // synonyms ("teléfonos", "smartphones", ...) and never exhausts
+      // the tool budget just because the category word itself doesn't
+      // appear in any real product name.
+      const searchCalls = result.toolCalls?.filter((c) => c.name === 'search_catalog') ?? []
+      expect(searchCalls).toHaveLength(1)
+      const toolResult = searchCalls[0].result as { category_inferred?: boolean; products: { name: string }[] }
+      expect(toolResult.category_inferred).toBe(true)
+      const names = toolResult.products.map((p) => p.name)
+      expect(names).toContain('SAMSUNG A26 5G 128GB + 6GB NEGRO')
+      expect(names).toContain('MOTOROLA G06 64GB + 4GB NARANJA')
+      expect(names).not.toContain('PANTALLA SAMSUNG A56')
+      expect(result.handoff).toBeFalsy()
+      expect(result.toolTurnsExhausted).toBeFalsy()
+    } finally {
+      vi.unstubAllGlobals()
+    }
   })
 })

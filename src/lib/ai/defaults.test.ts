@@ -392,3 +392,80 @@ describe('buildSystemPromptBlocks — content parity with buildSystemPrompt', ()
     expect(dynamicText).toBe('')
   })
 })
+
+// ============================================================
+// Mission I.1 audit (Oct 2026) — conversational behavior + exclusions.
+// These tests verify the PROMPT TEXT contains the expected instructions
+// — they are NOT, and must never be read as, proof that a real LLM
+// will actually follow them. Real-model behavior is explicitly out of
+// scope for this file (see the mission's own report) and is never
+// claimed here.
+// ============================================================
+describe('buildSystemPrompt — Mission I.1: conversational flow (greetings, guided discovery, reusing context)', () => {
+  const base = { userPrompt: null, mode: 'auto_reply' as const }
+
+  it('CONVERSATIONAL FLOW is present regardless of whether catalog tools are attached — a greeting or a general need can happen with no catalog configured too', () => {
+    const withCatalog = buildSystemPrompt({ ...base, catalogToolsAvailable: true })
+    const withoutCatalog = buildSystemPrompt({ ...base, catalogToolsAvailable: false })
+    expect(withCatalog).toContain('CONVERSATIONAL FLOW')
+    expect(withoutCatalog).toContain('CONVERSATIONAL FLOW')
+  })
+
+  it('instructs greeting back warmly and asking how to help, without requiring an exact model to help the customer', () => {
+    const prompt = buildSystemPrompt({ ...base, catalogToolsAvailable: true })
+    expect(prompt.toLowerCase()).toContain('greet back warmly and')
+    expect(prompt.toLowerCase()).toContain('never require the customer to already know an exact model/brand')
+  })
+
+  it('instructs asking ONE brief clarifying question or offering to check the category — never demanding brand AND budget AND preference', () => {
+    const prompt = buildSystemPrompt({ ...base, catalogToolsAvailable: true })
+    expect(prompt.toLowerCase()).toContain('ask one brief, useful clarifying question')
+    expect(prompt.toLowerCase()).toContain('never require brand and budget and preference')
+  })
+
+  it('instructs reusing brand/model/budget/color/capacity already given, and never re-asking', () => {
+    const prompt = buildSystemPrompt({ ...base, catalogToolsAvailable: true })
+    expect(prompt).toContain('REUSE WHAT THEY ALREADY TOLD YOU')
+    expect(prompt.toLowerCase()).toContain('never ask for it again')
+  })
+
+  it('instructs interpreting a short follow-up as the answer to the agent\'s own most recent question, never as an unrelated new request', () => {
+    const prompt = buildSystemPrompt({ ...base, catalogToolsAvailable: true })
+    expect(prompt.toLowerCase()).toContain('answers whatever')
+    expect(prompt.toLowerCase()).toContain('question you most recently asked')
+    expect(prompt.toLowerCase()).toContain('never as an unrelated new request')
+  })
+})
+
+describe('buildSystemPrompt — Mission I.1: brand/term exclusions never present the excluded item, never invent, never claim false success', () => {
+  const base = { userPrompt: null, mode: 'auto_reply' as const }
+
+  it('EXCLUSIONS section is present only when catalog tools are attached (it reasons over search_catalog results, which do not exist without a catalog)', () => {
+    const withCatalog = buildSystemPrompt({ ...base, catalogToolsAvailable: true })
+    const withoutCatalog = buildSystemPrompt({ ...base, catalogToolsAvailable: false })
+    expect(withCatalog).toContain('EXCLUSIONS')
+    expect(withoutCatalog).not.toContain('EXCLUSIONS')
+  })
+
+  it('instructs applying the exclusion using the REAL name/brand field — never guessing, never inventing a reason', () => {
+    const prompt = buildSystemPrompt({ ...base, catalogToolsAvailable: true })
+    expect(prompt.toLowerCase()).toContain('never present that excluded item as an answer')
+    expect(prompt).toContain('REAL `name`/`brand` field')
+    expect(prompt.toLowerCase()).toContain('never guess which products would have been excluded')
+  })
+
+  it('instructs an honest, useful response when filtering leaves zero results, and forbids claiming success on a zero-result or errored tool call', () => {
+    const prompt = buildSystemPrompt({ ...base, catalogToolsAvailable: true })
+    expect(prompt.toLowerCase()).toContain('if removing the excluded item leaves zero real results')
+    expect(prompt.toLowerCase()).toContain('never claim success with an empty list')
+    expect(prompt.toLowerCase()).toContain(
+      'never declare the search successful if the tool itself returned zero results or an error',
+    )
+  })
+
+  it('does NOT introduce a new `exclude` tool parameter — the instruction reasons over fields the tool already returns', () => {
+    const prompt = buildSystemPrompt({ ...base, catalogToolsAvailable: true })
+    expect(prompt).not.toContain('`exclude`')
+    expect(prompt).not.toContain('exclude_brand')
+  })
+})

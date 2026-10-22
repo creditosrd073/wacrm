@@ -32,11 +32,16 @@ const STOPWORDS = new Set([
  *  capacity) belongs to the LLM's own reasoning over the tool results,
  *  not to string-token matching. */
 const SYNONYM_GROUPS: string[][] = [
-  ['tv', 'televisor', 'television', 'smarttv', 'tele'],
+  // Plural forms included explicitly (not derived by stemming) for the
+  // two groups whose canonical target is SHORTER than the question
+  // word ("tv", "celular") — a plain substring check can't bridge
+  // "televisores" → "tv" or "celulares" → "celular" the way it already
+  // does for e.g. "neveras" → "nevera" (Mission E/F audit, Oct 2026).
+  ['tv', 'televisor', 'televisores', 'television', 'televisiones', 'smarttv', 'tele', 'teles'],
   ['aire', 'acondicionador', 'ac'],
   ['nevera', 'refrigerador', 'refrigeradora', 'frigider'],
   ['abanico', 'ventilador'],
-  ['celular', 'telefono', 'movil', 'smartphone', 'cel'],
+  ['celular', 'celulares', 'telefono', 'telefonos', 'movil', 'moviles', 'smartphone', 'smartphones', 'cel', 'celes'],
 ]
 const SYNONYM_MAP: Map<string, string> = new Map(
   SYNONYM_GROUPS.flatMap((group) => group.map((word) => [word, group[0]] as const)),
@@ -109,7 +114,7 @@ export function significantTokens(normalized: string): string[] {
  * something — which it structurally can't — and would wrongly find
  * nothing.
  */
-function tokenizeForRanking(normalized: string): { core: string[]; bonus: string[] } {
+export function tokenizeForRanking(normalized: string): { core: string[]; bonus: string[] } {
   const raw = normalized.split(' ').map((t) => t.trim()).filter(Boolean)
   const core: string[] = []
   for (const t of raw) {
@@ -126,6 +131,166 @@ function tokenizeForRanking(normalized: string): { core: string[]; bonus: string
     else if (/^\d{1,4}$/.test(a) && /^[a-z]{1,3}$/.test(b)) bonus.push(a + b)
   }
   return { core, bonus }
+}
+
+/**
+ * Mission E/F audit (Oct 2026) — real incident: the real "Consultas KC"
+ * catalog has NO phone whose name literally contains "celular"/
+ * "telefono"/"smartphone"/"movil" (the real naming convention is
+ * "<marca> <modelo> <almacenamiento>GB + <RAM>GB <color>", with no
+ * category word at all) — confirmed by direct, read-only query. A bare
+ * query for one of these words therefore matches NOTHING by text, or
+ * worse, accidentally matches an unrelated product whose name happens
+ * to contain the word for a different reason (the real incident: "TOUCH
+ * SAMSUNG S6810 MUNDO MOVIL" — "MOVIL" there is part of a reseller-name
+ * suffix, not a category descriptor — becoming the ONLY "match" for a
+ * "celular" query and getting presented as if it were representative).
+ *
+ * True only when EVERY core token of `query` is this exact phone-
+ * category synonym (after normalization/plural-mapping) — i.e. the
+ * query carries NO brand/model/attribute anchor of its own. A query
+ * like "celular samsung" is NOT a bare category query (it has a real
+ * anchor, "samsung", that can and should be text-matched normally) —
+ * only something like "celulares", "teléfonos", "qué smartphones
+ * tienen" (after routing/prompt-level cleanup already strips "qué...
+ * tienen") qualifies. Callers use this to skip straight to a
+ * STRUCTURAL (classify.ts-based) selection instead of a textual one —
+ * see data-source-provider.ts::searchByInferredDeviceCategory.
+ */
+export function isBarePhoneCategoryQuery(query: string): boolean {
+  const { core } = tokenizeForRanking(normalizeText(query))
+  return core.length > 0 && core.every((t) => t === 'celular')
+}
+
+/**
+ * Splits an EXPLICIT comma-separated category list ("neveras, estufas,
+ * lavadoras") into independent segments — never applied to a query
+ * without a comma, so a single query like "Samsung A07" is returned
+ * as its own one-element array, unchanged. Mission F audit (Oct 2026):
+ * the mandatory multi-category browse case ("neveras, estufas,
+ * lavadoras") needs OR semantics across genuinely different
+ * categories, which `rankBySignificantTokens`' own strict-majority
+ * threshold (deliberately AND-like, to disambiguate ONE specific
+ * model) cannot provide — no single product is ever both a nevera AND
+ * an estufa, so a plain majority-of-all-tokens match finds nothing
+ * even though every category has real stock.
+ */
+export function splitCategorySegments(query: string): string[] {
+  if (!query.includes(',')) return [query]
+  const segments = query.split(',').map((s) => s.trim()).filter(Boolean)
+  return segments.length > 0 ? segments : [query]
+}
+
+/**
+ * Every CORE token of `query` that carries a digit — a model code
+ * ("a07") or a size/capacity ("64") — with any trailing punctuation a
+ * comma-split can leave attached ("a07,") stripped first, so the
+ * comparison below is exact rather than relying on an accidental
+ * substring coincidence.
+ */
+function digitBearingCoreTokens(query: string): string[] {
+  return tokenizeForRanking(normalizeText(query)).core
+    .map((t) => t.replace(/[.,;:]+$/, ''))
+    .filter((t) => /\d/.test(t))
+}
+
+/**
+ * True when every digit-bearing token of `query` (if any) genuinely
+ * matches SOMETHING in `item`'s own tokens. Mission F.2 audit (Oct
+ * 2026) — real incident reproduced by direct execution: plain
+ * `rankBySignificantTokens('Samsung A07, el negro', …)` (no splitting
+ * at all) ALREADY admits "Samsung A05 … NEGRO" as a match, because
+ * "samsung" + "negro" alone (2 of the 3 significant tokens) clears the
+ * strict-majority threshold without "a07" needing to match anything —
+ * the same gap exists with no comma at all ("Samsung A07 negro"),
+ * confirmed by the same direct execution. `rankBySignificantTokens`'s
+ * own threshold is never touched (restriction: never relax it) — this
+ * is an ADDITIONAL, stricter filter applied only by the caller below,
+ * promoting a digit-bearing token from "counted toward the majority"
+ * to "mandatory" for that one candidate.
+ */
+function matchesEveryDigitToken<T>(digitTokens: string[], item: T, getSearchableText: (item: T) => string): boolean {
+  if (digitTokens.length === 0) return true
+  const candidateTokens = significantTokens(normalizeText(getSearchableText(item)))
+  return digitTokens.every((dt) => candidateTokens.some((ct) => tokenMatches(dt, ct)))
+}
+
+/**
+ * Like `rankBySignificantTokens`, but when `query` is an explicit
+ * comma-separated list (see `splitCategorySegments`), tries the FULL,
+ * un-split query FIRST — a comma very often separates a QUALIFIER for
+ * the SAME item ("Samsung A07, el negro") rather than a genuine list
+ * of independent categories ("neveras, estufas, lavadoras"), and the
+ * whole-query interpretation already resolves the former correctly
+ * (same model-disambiguation guarantee as a plain, comma-less query)
+ * once `matchesEveryDigitToken` guards the one known gap documented
+ * above. Only when that whole-query attempt finds NOTHING reliable —
+ * e.g. "neveras, estufas, lavadoras", where no single product is ever
+ * both a nevera AND an estufa — does it fall back to ranking EACH
+ * segment independently and unioning the results (OR semantics across
+ * segments).
+ *
+ * A query with no comma delegates straight to `rankSegment` (default
+ * `rankBySignificantTokens`) with byte-for-byte identical behavior —
+ * "Samsung A07" keeps its existing strict-majority model
+ * disambiguation completely unchanged; this never loosens that for a
+ * single, non-list query.
+ *
+ * `rankSegment` lets a caller (e.g. DataSourceCatalogProvider) swap in
+ * a different ranking strategy for an INDIVIDUAL segment — e.g. a bare
+ * phone-category segment ("celulares, neveras" → the "celulares"
+ * segment) can be resolved structurally instead of textually, while
+ * the other segment ("neveras") still resolves textually — without
+ * this function needing to know anything about that strategy itself.
+ */
+export function rankBySignificantTokensMultiCategory<T>(
+  query: string,
+  candidates: T[],
+  getSearchableText: (item: T) => string,
+  rankSegment: (segmentQuery: string, items: T[], getText: (item: T) => string) => ScoredMatch<T>[] = rankBySignificantTokens,
+): ScoredMatch<T>[] {
+  const segments = splitCategorySegments(query)
+  if (segments.length <= 1) return rankSegment(query, candidates, getSearchableText)
+
+  // Mission F.2 audit (Oct 2026) — reproduced by direct execution: if
+  // ANY segment independently qualifies as a bare phone-category word
+  // (isBarePhoneCategoryQuery), this is unambiguously a genuine list of
+  // distinct categories ("celulares, neveras"), never a single item
+  // with a trailing qualifier — a real qualifier phrase ("el negro")
+  // is never ALSO independently a bare-category trigger. Skip the
+  // whole-query shortcut below entirely in that case and go straight
+  // to the per-segment union: trying the whole comma-joined string
+  // first was found to silently DROP the phone category here — the
+  // generic "a subjective qualifier that matches nothing must not veto
+  // an otherwise-good query" relaxation (rankBySignificantTokens' own
+  // effectiveCore logic) treats the un-matchable "celulares" token as
+  // a droppable qualifier rather than its own category, so the whole-
+  // query attempt "succeeds" with only the nevera and never reaches
+  // the per-segment split that would have found the phones too.
+  const needsPerSegmentHandling = segments.some((s) => isBarePhoneCategoryQuery(s))
+
+  if (!needsPerSegmentHandling) {
+    const digitTokens = digitBearingCoreTokens(query)
+    const wholeQueryResult = rankSegment(query, candidates, getSearchableText).filter((m) =>
+      matchesEveryDigitToken(digitTokens, m.item, getSearchableText),
+    )
+    if (wholeQueryResult.length > 0) return wholeQueryResult
+  }
+
+  const best = new Map<T, ScoredMatch<T>>()
+  for (const segment of segments) {
+    for (const match of rankSegment(segment, candidates, getSearchableText)) {
+      const existing = best.get(match.item)
+      if (!existing || match.score > existing.score) best.set(match.item, match)
+    }
+  }
+  return [...best.values()].sort((a, b) => {
+    if (b.score !== a.score) return b.score - a.score
+    if (b.matchedTokens !== a.matchedTokens) return b.matchedTokens - a.matchedTokens
+    const nameA = getSearchableText(a.item)
+    const nameB = getSearchableText(b.item)
+    return nameA.length - nameB.length || nameA.localeCompare(nameB)
+  })
 }
 
 /** Iterative Levenshtein edit distance — small inputs only (product
@@ -196,7 +361,7 @@ const MODEL_CODE_TOKEN_PATTERN = /^[a-z]{1,3}\d{1,4}$/
  *  fallback below still apply unchanged — this only removes the one
  *  substring shortcut that conflated a short code with a longer,
  *  different one. */
-function tokenMatches(token: string, candidateToken: string): boolean {
+export function tokenMatches(token: string, candidateToken: string): boolean {
   if (token === candidateToken) return true
   const bothModelCodes = MODEL_CODE_TOKEN_PATTERN.test(token) && MODEL_CODE_TOKEN_PATTERN.test(candidateToken)
   if (!bothModelCodes) {
